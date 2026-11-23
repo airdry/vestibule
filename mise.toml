@@ -7,6 +7,7 @@ rust = "1.100.0"
 # Quality gates from AGENTS.md (mokevnin/dev-quality-gates#rust).
 cargo-deny = "0.22.0"
 "cargo:cargo-machete" = "0.10.1"
+cmake = "3"
 
 [tasks.fmt]
 description = "Format all Rust sources"
