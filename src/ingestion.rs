@@ -71,6 +71,12 @@ impl ForwardedMetadata {
     }
 }
 
+/// Locks the `Ingestion Queue`, tolerating lock poisoning: the queue state
+/// itself is always valid, so we prefer continuing over failing the request.
+pub fn lock_wal(wal: &Mutex<Wal>) -> std::sync::MutexGuard<'_, Wal> {
+    wal.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The outcome of handling an `Ingestion Route` request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IngestionOutcome {
@@ -108,7 +114,7 @@ impl IngestionPipeline {
     ///
     /// Returns a [`WalError`] when the record cannot be durably written.
     pub fn accept(&self, route: &str, auth: &str, body: &[u8]) -> Result<(), WalError> {
-        let mut wal = self.wal.lock().expect("lock ingestion queue");
+        let mut wal = lock_wal(&self.wal);
         wal.append(route, auth, body)
     }
 }

@@ -16,7 +16,7 @@ use crate::admin_plane::AdminPlane;
 use crate::config::{Config, FsyncMode};
 use crate::data_plane::DataPlaneProxy;
 use crate::delivery::{DeliveryWorker, RetryPolicy};
-use crate::ingestion::IngestionPipeline;
+use crate::ingestion::{IngestionPipeline, lock_wal};
 use crate::wal::{SystemClock, Wal};
 
 /// Errors while assembling or starting the server.
@@ -102,7 +102,7 @@ impl pingora::services::background::BackgroundService for FsyncWorker {
                 _ = shutdown.changed() => return,
                 _ = tokio::time::sleep(self.interval) => {}
             }
-            if let Err(error) = self.wal.lock().expect("lock ingestion queue").sync() {
+            if let Err(error) = lock_wal(&self.wal).sync() {
                 eprintln!("fsync worker: failed to sync the ingestion queue: {error}");
             }
         }

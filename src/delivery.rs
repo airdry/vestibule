@@ -15,6 +15,7 @@ use reqwest::StatusCode;
 
 use crate::config::UpstreamTarget;
 use crate::ingestion::ForwardedMetadata;
+use crate::ingestion::lock_wal;
 use crate::wal::{PendingRecord, Wal};
 
 /// Tuning knobs of the delivery retry strategy.
@@ -134,7 +135,7 @@ impl DeliveryWorker {
 
     /// Performs one delivery attempt over the head record, if any.
     async fn tick(&self) -> Outcome {
-        let next = { self.wal.lock().expect("lock ingestion queue").next_record() };
+        let next = { lock_wal(&self.wal).next_record() };
         let pending = match next {
             Ok(pending) => pending,
             Err(error) => {
@@ -148,10 +149,7 @@ impl DeliveryWorker {
 
         match self.deliver(&pending).await {
             Decision::Commit => {
-                let committed = {
-                    let mut wal = self.wal.lock().expect("lock ingestion queue");
-                    wal.commit(pending.position)
-                };
+                let committed = lock_wal(&self.wal).commit(pending.position);
                 if let Err(error) = committed {
                     eprintln!("delivery: failed to commit the queue checkpoint: {error}");
                     return Outcome::Retry;

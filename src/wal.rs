@@ -78,6 +78,30 @@ pub enum WalError {
     },
 }
 
+/// Reads exactly 8 little-endian bytes as a `u64`.
+fn le_u64(bytes: &[u8]) -> Result<u64, FrameError> {
+    bytes
+        .try_into()
+        .map(u64::from_le_bytes)
+        .map_err(|_| FrameError::Corrupt)
+}
+
+/// Reads exactly 4 little-endian bytes as a `u32`.
+fn le_u32(bytes: &[u8]) -> Result<u32, FrameError> {
+    bytes
+        .try_into()
+        .map(u32::from_le_bytes)
+        .map_err(|_| FrameError::Corrupt)
+}
+
+/// Reads exactly 2 little-endian bytes as a `u16`.
+fn le_u16(bytes: &[u8]) -> Result<u16, FrameError> {
+    bytes
+        .try_into()
+        .map(u16::from_le_bytes)
+        .map_err(|_| FrameError::Corrupt)
+}
+
 impl WalError {
     fn io(context: impl Into<String>, source: std::io::Error) -> Self {
         Self::Io {
@@ -381,8 +405,18 @@ fn read_checkpoint(dir: &Path) -> Result<Option<Position>, WalError> {
         ));
     }
     Ok(Some(Position {
-        segment_id: u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")),
-        offset: u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes")),
+        segment_id: le_u64(&bytes[..8]).map_err(|_| {
+            WalError::io(
+                "parse checkpoint",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "checkpoint too short"),
+            )
+        })?,
+        offset: le_u64(&bytes[8..]).map_err(|_| {
+            WalError::io(
+                "parse checkpoint",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "checkpoint too short"),
+            )
+        })?,
     }))
 }
 
@@ -469,8 +503,8 @@ fn read_frame_at(file: &mut File, offset: u64) -> Result<Option<Frame>, FrameErr
         ReadOutcome::Partial => return Err(FrameError::Incomplete),
         ReadOutcome::Full => {}
     }
-    let data_len = u32::from_le_bytes(header[..4].try_into().expect("4 bytes")) as usize;
-    let stored_crc = u32::from_le_bytes(header[4..].try_into().expect("4 bytes"));
+    let data_len = le_u32(&header[..4])? as usize;
+    let stored_crc = le_u32(&header[4..])?;
 
     let mut data = vec![0_u8; data_len];
     match read_exact(file, &mut data) {
@@ -524,17 +558,12 @@ fn decode_frame(data: &[u8]) -> Result<WalRecord, FrameError> {
         Ok(slice)
     };
 
-    let enqueued_at_unix_ms =
-        u64::from_le_bytes(take(&mut cursor, 8)?.try_into().expect("8 bytes"));
-    let route_len = usize::from(u16::from_le_bytes(
-        take(&mut cursor, 2)?.try_into().expect("2 bytes"),
-    ));
+    let enqueued_at_unix_ms = le_u64(take(&mut cursor, 8)?)?;
+    let route_len = usize::from(le_u16(take(&mut cursor, 2)?)?);
     let route = String::from_utf8_lossy(take(&mut cursor, route_len)?).into_owned();
-    let auth_len = usize::from(u16::from_le_bytes(
-        take(&mut cursor, 2)?.try_into().expect("2 bytes"),
-    ));
+    let auth_len = usize::from(le_u16(take(&mut cursor, 2)?)?);
     let auth = String::from_utf8_lossy(take(&mut cursor, auth_len)?).into_owned();
-    let body_len = u32::from_le_bytes(take(&mut cursor, 4)?.try_into().expect("4 bytes")) as usize;
+    let body_len = le_u32(take(&mut cursor, 4)?)? as usize;
     let body = take(&mut cursor, body_len)?.to_vec();
 
     if cursor != data.len() {
