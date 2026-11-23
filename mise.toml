@@ -1,0 +1,37 @@
+# Tool versions are pinned for reproducible local development.
+# Run `mise install` after cloning, then `mise run` to list tasks.
+
+[tools]
+# Pingora MSRV is 1.85 (rolling 6-month policy); pin latest stable.
+rust = "1.100.0"
+# Quality gates from AGENTS.md (mokevnin/dev-quality-gates#rust).
+cargo-deny = "0.22.0"
+"cargo:cargo-machete" = "0.10.1"
+
+[tasks.fmt]
+description = "Format all Rust sources"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "rustfmt check (quality gate)"
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "clippy with warnings denied (quality gate)"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.machete]
+description = "Find unused dependencies (quality gate)"
+run = "cargo machete"
+
+[tasks.deny]
+description = "cargo-deny: advisories, licenses, bans (quality gate)"
+run = "cargo deny check"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --all"
+
+[tasks.gates]
+description = "Run every quality gate (fmt-check, lint, machete, deny, test)"
+depends = ["fmt-check", "lint", "machete", "deny", "test"]
