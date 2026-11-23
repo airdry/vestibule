@@ -287,6 +287,94 @@ pub fn start_service(yaml: &str) -> TestApp {
     }
 }
 
+/// Blocks until `condition` holds or a 10s deadline passes.
+pub fn wait_until<F: Fn() -> bool>(condition: F) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if condition() {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("condition was not met within 10 seconds");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The service running as a real OS process (for restart-resilience tests).
+pub struct ServiceProcess {
+    child: std::process::Child,
+    pub data_plane_url: String,
+    pub admin_url: String,
+}
+
+impl ServiceProcess {
+    /// Starts the built binary with the given config file and waits until
+    /// both planes accept connections.
+    pub fn start(config_path: &std::path::Path) -> Self {
+        let binary = env!("CARGO_BIN_EXE_sentry-ratelimiter");
+        let child = std::process::Command::new(binary)
+            .arg("--config")
+            .arg(config_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn service process");
+
+        let yaml = std::fs::read_to_string(config_path).expect("read test config");
+        let (data_plane_url, admin_url) = urls_from_config(&yaml);
+        wait_until_listening(
+            data_plane_url
+                .trim_start_matches("http://")
+                .parse()
+                .expect("parse data plane addr"),
+        );
+        wait_until_listening(
+            admin_url
+                .trim_start_matches("http://")
+                .parse()
+                .expect("parse admin addr"),
+        );
+
+        Self {
+            child,
+            data_plane_url,
+            admin_url,
+        }
+    }
+
+    /// Kills the process without any chance to flush gracefully.
+    pub fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Extracts the configured plane addresses from a config YAML (tests only).
+fn urls_from_config(yaml: &str) -> (String, String) {
+    let mut data_plane = String::new();
+    let mut admin = String::new();
+    for line in yaml.lines() {
+        let line = line.trim();
+        if let Some(addr) = line.strip_prefix("data_plane_addr: ") {
+            data_plane = addr.trim_matches('"').to_string();
+        } else if let Some(addr) = line.strip_prefix("admin_addr: ") {
+            admin = addr.trim_matches('"').to_string();
+        }
+    }
+    (format!("http://{data_plane}"), format!("http://{admin}"))
+}
+
+/// Writes `yaml` to `config.yaml` inside a fresh directory and returns the
+/// file path.
+pub fn write_config(yaml: &str) -> std::path::PathBuf {
+    let dir = tempdir();
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    let path = dir.join("config.yaml");
+    std::fs::write(&path, yaml).expect("write config");
+    path
+}
+
 /// A blocking HTTP client for talking to the service under test.
 pub fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
