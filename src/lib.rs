@@ -8,3 +8,4 @@ pub mod admin_plane;
 pub mod app;
 pub mod config;
 pub mod data_plane;
+pub mod wal;
