@@ -251,11 +251,32 @@ pub fn http_client() -> reqwest::blocking::Client {
 
 /// Minimal YAML configuration for the given Upstream URL and ports.
 pub fn config_yaml(upstream_url: &str, data_plane_port: u16, admin_port: u16) -> String {
+    config_yaml_with(upstream_url, data_plane_port, admin_port, "")
+}
+
+/// Full YAML configuration with extra sections appended after `queue`.
+///
+/// The `queue.dir` section is always included, pointing at a temporary
+/// directory kept for the lifetime of the process.
+pub fn config_yaml_with(
+    upstream_url: &str,
+    data_plane_port: u16,
+    admin_port: u16,
+    extra_sections: &str,
+) -> String {
     format!(
         "server:\n\
          \x20 data_plane_addr: \"127.0.0.1:{data_plane_port}\"\n\
          \x20 admin_addr: \"127.0.0.1:{admin_port}\"\n\
          upstream:\n\
-         \x20 url: \"{upstream_url}\"\n"
+         \x20 url: \"{upstream_url}\"\n\
+         queue:\n\
+         \x20 dir: \"{}\"\n{extra_sections}",
+        tempdir().display(),
     )
+}
+
+/// A temporary directory that is kept (not deleted) until process exit.
+pub fn tempdir() -> std::path::PathBuf {
+    tempfile::TempDir::new().expect("create tempdir").keep()
 }

@@ -648,13 +648,19 @@ mod tests {
 
         let mut wal =
             Wal::open(&dir, &test_settings(&dir), MockClock::new(1_000)).expect("reopen wal");
-        let first = wal.next_record().expect("read first").expect("first record");
+        let first = wal
+            .next_record()
+            .expect("read first")
+            .expect("first record");
         assert_eq!(first.record.route, "/api/1/envelope/");
         assert_eq!(first.record.auth, "auth-1");
         assert_eq!(first.record.body, record_body(1));
         wal.commit(first.position).expect("commit first");
 
-        let second = wal.next_record().expect("read second").expect("second record");
+        let second = wal
+            .next_record()
+            .expect("read second")
+            .expect("second record");
         assert_eq!(second.record.body, record_body(2));
         wal.commit(second.position).expect("commit second");
 
@@ -708,14 +714,20 @@ mod tests {
 
         let mut wal =
             Wal::open(&dir, &test_settings(&dir), MockClock::new(1_000)).expect("reopen wal");
-        let pending = wal.next_record().expect("read").expect("first record survives");
+        let pending = wal
+            .next_record()
+            .expect("read")
+            .expect("first record survives");
         assert_eq!(pending.record.body, record_body(1));
         wal.commit(pending.position).expect("commit");
         assert!(wal.next_record().expect("read truncated").is_none());
 
         // New appends work after recovery.
         append_record(&mut wal, 3);
-        let pending = wal.next_record().expect("read").expect("record after recovery");
+        let pending = wal
+            .next_record()
+            .expect("read")
+            .expect("record after recovery");
         assert_eq!(pending.record.body, record_body(3));
     }
 
@@ -737,7 +749,10 @@ mod tests {
 
         let mut wal =
             Wal::open(&dir, &test_settings(&dir), MockClock::new(1_000)).expect("reopen wal");
-        let pending = wal.next_record().expect("read").expect("first record survives");
+        let pending = wal
+            .next_record()
+            .expect("read")
+            .expect("first record survives");
         assert_eq!(pending.record.body, record_body(1));
         wal.commit(pending.position).expect("commit");
         assert!(wal.next_record().expect("read corrupted").is_none());
@@ -803,7 +818,10 @@ mod tests {
         // Expire the queue, then append a fresh record after the expiry.
         clock.advance_ms(61_000);
         append_record(&mut wal, 2);
-        let pending = wal.next_record().expect("read").expect("record after expiry");
+        let pending = wal
+            .next_record()
+            .expect("read")
+            .expect("record after expiry");
         assert_eq!(pending.record.body, record_body(2));
         wal.commit(pending.position).expect("commit");
 
@@ -814,7 +832,10 @@ mod tests {
 
         // And the queue keeps accepting fresh records after the stale skip.
         append_record(&mut wal, 4);
-        let pending = wal.next_record().expect("read").expect("fresh record after skip");
+        let pending = wal
+            .next_record()
+            .expect("read")
+            .expect("fresh record after skip");
         assert_eq!(pending.record.body, record_body(4));
     }
 
@@ -846,7 +867,10 @@ mod tests {
         append_record(&mut wal, 1);
 
         let first = wal.next_record().expect("read").expect("first read");
-        let second = wal.next_record().expect("read").expect("uncommitted replay");
+        let second = wal
+            .next_record()
+            .expect("read")
+            .expect("uncommitted replay");
         assert_eq!(first, second);
     }
 }
