@@ -1,0 +1,6 @@
+# Local issue tracker & scratch artifacts (kept local, never committed)
+.scratch/
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
