@@ -14,8 +14,7 @@ use pingora::services::background::BackgroundService;
 use reqwest::StatusCode;
 
 use crate::config::UpstreamTarget;
-use crate::ingestion::ForwardedMetadata;
-use crate::ingestion::lock_wal;
+use crate::ingestion::{ForwardedMetadata, lock_wal};
 use crate::wal::{PendingRecord, Wal};
 
 /// Tuning knobs of the delivery retry strategy.
