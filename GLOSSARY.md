@@ -1,0 +1,41 @@
+# sentry-ratelimiter
+
+An HTTP rate-limiting and buffering proxy that sits in front of a self-hosted Sentry installation to protect Sentry's processing pipeline from SDK traffic spikes.
+
+## Language
+
+**Upstream**:
+The target Sentry reverse proxy (typically self-hosted Sentry's nginx in front of Relay) that receives forwarded traffic.
+_Avoid_: nginx, backend, downstream, target
+
+**Ingestion Route**:
+An HTTP endpoint carrying Sentry SDK telemetry that is inspected and subject to rate limiting (matching `/api/{project_id}/...` or `/api/store/`).
+_Avoid_: SDK route, API endpoint, relay route
+
+**Pass-Through Traffic**:
+Non-ingestion HTTP requests (such as Sentry UI, static assets, `/js-sdk/`, and `/api/0/relays/`) forwarded transparently to Upstream without rate-limit inspection.
+_Avoid_: static traffic, non-SDK traffic, bypassed requests
+
+**Envelope**:
+A newline-delimited Sentry ingestion payload containing an envelope header and one or more Items sent in a single HTTP request.
+_Avoid_: batch, request body, payload
+
+**Item**:
+An individual telemetry unit within an Envelope — such as an error `event`, a `transaction`, or a `session` — that carries its own type header and body.
+_Avoid_: event (when referring to items generically), record, entry
+
+**Item Category**:
+The rate-limiting classification of an Item: `event` (error event), `transaction`, or `other` (all remaining Sentry item types such as `session`, `replay_event`, `profile`, `attachment`, `client_report`).
+_Avoid_: event type, kind, metric type
+
+**Rate Limit Rule**:
+A configured throughput constraint (`rate` and `burst`) scoped by `project_id`, `environment`, and Item Category, matched from most specific to global defaults.
+_Avoid_: quota, policy, throttle
+
+**Ingestion Queue**:
+The durable, disk-backed store-and-forward queue that holds accepted telemetry between HTTP ingestion and asynchronous batched delivery to Upstream.
+_Avoid_: failover queue, buffer, spool
+
+**Upstream Health**:
+The tracked availability state of Upstream (`Healthy` or `Unhealthy`), driven by active health probes and passive delivery failures, controlling whether queued telemetry is forwarded or held.
+_Avoid_: circuit state, nginx status, backend health
