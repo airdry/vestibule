@@ -6,13 +6,16 @@
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use pingora::prelude::*;
 use pingora::proxy::http_proxy_service_with_name;
 
 use crate::admin_plane::AdminPlane;
-use crate::config::Config;
+use crate::config::{Config, FsyncMode};
 use crate::data_plane::DataPlaneProxy;
+use crate::delivery::{DeliveryWorker, RetryPolicy};
 use crate::ingestion::IngestionPipeline;
 use crate::wal::{SystemClock, Wal};
 
@@ -58,8 +61,50 @@ pub fn run(config: Config) -> Result<Infallible, AppError> {
         http_proxy_service_with_name(&server.configuration, AdminPlane, "Admin Plane");
     admin_plane.add_tcp(&config.server.admin_addr.to_string());
 
+    let delivery_worker = DeliveryWorker::new(
+        Arc::clone(&wal),
+        config.upstream.clone(),
+        RetryPolicy::default(),
+    )
+    .map_err(|message| AppError::ServerInit { message })?;
+    server.add_service(background_service("Delivery Worker", delivery_worker));
+
+    if config.queue.fsync_mode == FsyncMode::Periodic {
+        server.add_service(background_service(
+            "Periodic Fsync",
+            FsyncWorker::new(Arc::clone(&wal), config.queue.fsync_interval),
+        ));
+    }
+
     server.add_service(data_plane);
     server.add_service(admin_plane);
 
     server.run_forever()
+}
+
+/// Periodically fsyncs the `Ingestion Queue` while the server runs.
+struct FsyncWorker {
+    wal: Arc<Mutex<Wal>>,
+    interval: Duration,
+}
+
+impl FsyncWorker {
+    fn new(wal: Arc<Mutex<Wal>>, interval: Duration) -> Self {
+        Self { wal, interval }
+    }
+}
+
+#[async_trait]
+impl pingora::services::background::BackgroundService for FsyncWorker {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => return,
+                _ = tokio::time::sleep(self.interval) => {}
+            }
+            if let Err(error) = self.wal.lock().expect("lock ingestion queue").sync() {
+                eprintln!("fsync worker: failed to sync the ingestion queue: {error}");
+            }
+        }
+    }
 }

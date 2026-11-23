@@ -27,6 +27,8 @@ pub struct RecordedRequest {
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Arrival time, to reason about delivery retry pacing.
+    pub recorded_at: Instant,
 }
 
 impl RecordedRequest {
@@ -45,16 +47,20 @@ pub struct UpstreamResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Artificial delay before responding.
+    pub latency: Duration,
 }
 
 impl UpstreamResponse {
     /// A minimal `200 OK` response.
     pub fn ok(body: &str) -> Self {
-        Self {
-            status: 200,
-            headers: vec![],
-            body: body.as_bytes().to_vec(),
-        }
+        Self::with_status(200).with_body(body)
+    }
+
+    /// Sets an artificial delay before the response is sent.
+    pub fn with_latency(mut self, latency: Duration) -> Self {
+        self.latency = latency;
+        self
     }
 
     /// A response with only a status code and an empty body.
@@ -63,7 +69,14 @@ impl UpstreamResponse {
             status,
             headers: vec![],
             body: Vec::new(),
+            latency: Duration::ZERO,
         }
+    }
+
+    /// A response with a text body.
+    pub fn with_body(mut self, body: &str) -> Self {
+        self.body = body.as_bytes().to_vec();
+        self
     }
 }
 
@@ -72,7 +85,28 @@ impl UpstreamResponse {
 pub struct MockUpstream {
     pub addr: SocketAddr,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
-    response: Arc<Mutex<UpstreamResponse>>,
+    response: Arc<Mutex<ResponsePlan>>,
+}
+
+/// The mock `Upstream` response schedule.
+enum ResponsePlan {
+    Single(UpstreamResponse),
+    Sequence(Vec<UpstreamResponse>),
+}
+
+impl ResponsePlan {
+    fn next(&mut self) -> UpstreamResponse {
+        match self {
+            ResponsePlan::Single(response) => response.clone(),
+            ResponsePlan::Sequence(responses) => {
+                if responses.is_empty() {
+                    UpstreamResponse::with_status(500)
+                } else {
+                    responses.remove(0)
+                }
+            }
+        }
+    }
 }
 
 impl MockUpstream {
@@ -85,7 +119,7 @@ impl MockUpstream {
         let addr = listener.local_addr().expect("read mock upstream address");
 
         let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
-        let response = Arc::new(Mutex::new(response));
+        let response = Arc::new(Mutex::new(ResponsePlan::Single(response)));
 
         let requests_for_task = Arc::clone(&requests);
         let response_for_task = Arc::clone(&response);
@@ -130,14 +164,20 @@ impl MockUpstream {
 
     /// Replaces the response served to subsequent requests.
     pub fn set_response(&self, response: UpstreamResponse) {
-        *self.response.lock().expect("lock response") = response;
+        *self.response.lock().expect("lock response") = ResponsePlan::Single(response);
+    }
+
+    /// Serves the given responses one per incoming request; after the
+    /// sequence is exhausted, every request is answered with `500`.
+    pub fn set_responses(&self, responses: Vec<UpstreamResponse>) {
+        *self.response.lock().expect("lock responses") = ResponsePlan::Sequence(responses);
     }
 }
 
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
-    response: Arc<Mutex<UpstreamResponse>>,
+    response: Arc<Mutex<ResponsePlan>>,
 ) {
     let service = service_fn(move |request: Request<hyper::body::Incoming>| {
         let requests = Arc::clone(&requests);
@@ -169,10 +209,15 @@ async fn serve_connection(
                     })
                     .collect(),
                 body,
+                recorded_at: Instant::now(),
             };
             requests.lock().expect("lock requests").push(recorded);
 
-            let spec = response.lock().expect("lock response").clone();
+            let spec = {
+                let mut plan = response.lock().expect("lock responses");
+                plan.next()
+            };
+            tokio::time::sleep(spec.latency).await;
             let mut builder = Response::builder().status(spec.status);
             for (name, value) in spec.headers {
                 builder = builder.header(name, value);

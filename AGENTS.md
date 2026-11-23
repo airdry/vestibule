@@ -24,6 +24,7 @@ Single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root. See `doc
 ### Strict Test-Driven Development (Red → Green → Refactor)
 
 - Always load and follow the `tdd`, `rust-testing`, `rust-best-practices`, and `rust-async-patterns` skills when implementing tickets.
+- Also load and follow the `clean-architecture` and `clean-code` skills for all production-code work: keep the Dependency Rule across module boundaries, and keep functions small, well-named, and free of smells.
 - **Test first, always**: write a failing test for the next acceptance criterion before writing production code. Run `cargo test` and confirm it fails for the expected reason (**Red**).
 - Write the minimal production code required to make the test pass (**Green**).
 - Refactor only while tests are green, keeping changes clean and minimal (**Refactor**).

@@ -85,6 +85,7 @@ pub enum FsyncMode {
 }
 
 const DEFAULT_QUEUE_DIR: &str = "queue";
+const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_COMPRESSED_BODY_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_DECOMPRESSED_BODY_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_QUEUE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -108,6 +109,8 @@ pub struct UpstreamTarget {
     pub port: u16,
     /// Path prefix from the `Upstream` URL; empty when absent.
     pub path_prefix: String,
+    /// Per-request delivery timeout towards the `Upstream`.
+    pub timeout: Duration,
 }
 
 /// Loads and validates the YAML configuration from `path`.
@@ -162,12 +165,21 @@ impl Config {
         )?)
         .map_err(|message| Self::invalid(path, format!("server.admin_addr: {message}")))?;
         let url = required_field(path, &upstream.url, "upstream.url")?;
-        let upstream = UpstreamTarget::from_url(url)
+        let timeout = upstream.timeout;
+        let mut upstream = UpstreamTarget::from_url(url)
             .map_err(|message| Self::invalid(path, format!("upstream.url: {message}")))?;
+        if let Some(timeout) = timeout {
+            if timeout.is_zero() {
+                return Err(Self::invalid(
+                    path,
+                    "upstream.timeout must be greater than zero".to_string(),
+                ));
+            }
+            upstream.timeout = timeout;
+        };
 
         let ingest = Self::ingest_from_raw(raw.ingest, path)?;
         let queue = Self::queue_from_raw(raw.queue, path)?;
-
         Ok(Self {
             server: ServerSettings {
                 data_plane_addr,
@@ -449,6 +461,7 @@ impl UpstreamTarget {
             host,
             port,
             path_prefix,
+            timeout: DEFAULT_UPSTREAM_TIMEOUT,
         })
     }
 }
@@ -544,6 +557,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_upstream_timeout_and_applies_default() {
+        let default_config = Config::from_str(&base_yaml(), "<test config>").unwrap();
+        assert_eq!(default_config.upstream.timeout, Duration::from_secs(10));
+
+        let yaml = "server:\n\
+         \x20 data_plane_addr: \"127.0.0.1:18080\"\n\
+         \x20 admin_addr: \"127.0.0.1:18081\"\n\
+         upstream:\n\
+         \x20 url: \"http://127.0.0.1:18082\"\n\
+         \x20 timeout: 250ms\n";
+        let config = Config::from_str(yaml, "<test config>").unwrap();
+        assert_eq!(config.upstream.timeout, Duration::from_millis(250));
+    }
+
+    #[test]
     fn rejects_non_positive_queue_sizes() {
         let yaml = format!(
             "{}\
@@ -601,4 +629,6 @@ struct RawServer {
 #[serde(deny_unknown_fields)]
 struct RawUpstream {
     url: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    timeout: Option<Duration>,
 }

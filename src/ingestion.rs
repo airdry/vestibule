@@ -64,9 +64,7 @@ impl ForwardedMetadata {
                 .strip_prefix("H ")
                 .and_then(|header| header.split_once(": "))
             {
-                metadata
-                    .headers
-                    .push((name.to_string(), value.to_string()));
+                metadata.headers.push((name.to_string(), value.to_string()));
             }
         }
         metadata
