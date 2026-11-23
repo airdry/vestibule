@@ -31,10 +31,12 @@ Single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root. See `doc
 
 ### Rust Quality Gates
 
-Before considering any ticket complete, verify:
+Follow the curated Rust quality gates from `https://github.com/mokevnin/dev-quality-gates#rust`. Before considering any ticket complete, verify:
 
-- `cargo fmt --check` passes
-- `cargo clippy --all-targets -- -D warnings` passes
+- `cargo fmt --check` (`rustfmt`) passes
+- `cargo clippy --all-targets -- -D warnings` (`clippy`) passes
+- `cargo machete` (`cargo-machete`) finds no unused dependencies in `Cargo.toml`
+- `cargo deny check` (`cargo-deny` with a repo-root `deny.toml` covering RustSec advisories, licenses, bans/duplicates, and allowed registries) passes
 - `cargo test` passes with zero ignored/failing tests
 - No `.unwrap()` or `.expect()` in production (non-test) code paths; propagate typed errors cleanly (`thiserror` for library/domain errors, `anyhow` only at top-level binary boundaries).
 
