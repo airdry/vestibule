@@ -14,17 +14,25 @@ The five canonical triage roles keep their default label strings. See `docs/agen
 
 Single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
-### Code search
+### Code search & text processing
 
 <!-- Search tool priority rule:
      Always prefer `rg` (ripgrep) or `ast-grep` over plain `grep`. Fallback to
      `grep` ONLY if ripgrep or ast-grep is unavailable or misbehaves in the
      current environment. Rationale: rg respects .gitignore, skips binaries,
      and is faster; ast-grep understands code structure (AST) instead of raw
-     text, so pattern searches don't produce false positives. -->
+     text, so pattern searches don't produce false positives.
+
+     Substitution tool priority rule:
+     Always prefer `sd` over `sed`. Rationale: sd matches literal strings by
+     default (no accidental regex metacharacters), needs no delimiter
+     escaping, and avoids the GNU vs BSD `sed -i` incompatibility that breaks
+     scripts across macOS/Linux. Fallback to `sed` ONLY when `sd` is not
+     available or misbehaves. -->
 
 - Use the `ast-grep` skill for code search and structural queries instead of plain `grep`/`rg` when looking for code patterns, specific language constructs, or performing complex code queries. Plain text search is acceptable only for non-code files or trivial literal lookups.
 - **Priority rule**: every time you are about to run `grep`, use `rg` (ripgrep) or `ast-grep` instead. Use plain `grep` only as a fallback when ripgrep or ast-grep do not work correctly in the given context (unavailable, broken, or producing wrong results).
+- **Priority rule**: every time you are about to run `sed`, use `sd` instead for substitutions and in-place edits. Use plain `sed` only as a fallback when `sd` is not available or works incorrectly in the given context.
 
 ## Engineering & TDD Workflow
 
