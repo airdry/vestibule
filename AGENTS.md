@@ -28,11 +28,20 @@ Single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root. See `doc
      default (no accidental regex metacharacters), needs no delimiter
      escaping, and avoids the GNU vs BSD `sed -i` incompatibility that breaks
      scripts across macOS/Linux. Fallback to `sed` ONLY when `sd` is not
-     available or misbehaves. -->
+     available or misbehaves.
+
+     File search tool priority rule:
+     Always prefer `fd` over plain `find`. Rationale: fd respects .gitignore
+     (skips target/, .git/, node_modules and other ignored paths) by default,
+     has saner regex syntax, a friendlier output format, and is significantly
+     faster. Fallback to `find` ONLY when `fd` is not available or when its
+     .gitignore-aware filtering is itself the problem (e.g. you deliberately
+     need to enumerate ignored files). -->
 
 - Use the `ast-grep` skill for code search and structural queries instead of plain `grep`/`rg` when looking for code patterns, specific language constructs, or performing complex code queries. Plain text search is acceptable only for non-code files or trivial literal lookups.
 - **Priority rule**: every time you are about to run `grep`, use `rg` (ripgrep) or `ast-grep` instead. Use plain `grep` only as a fallback when ripgrep or ast-grep do not work correctly in the given context (unavailable, broken, or producing wrong results).
 - **Priority rule**: every time you are about to run `sed`, use `sd` instead for substitutions and in-place edits. Use plain `sed` only as a fallback when `sd` is not available or works incorrectly in the given context.
+- **Priority rule**: every time you are about to run `find`, use `fd` instead for file and directory searches. Use plain `find` only as a fallback when `fd` is not available or works incorrectly in the given context.
 
 ## Engineering & TDD Workflow
 
