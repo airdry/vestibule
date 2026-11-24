@@ -14,6 +14,10 @@ The five canonical triage roles keep their default label strings. See `docs/agen
 
 Single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+### Code search
+
+- Use the `ast-grep` skill for code search and structural queries instead of plain `grep`/`rg` when looking for code patterns, specific language constructs, or performing complex code queries. Plain text search is acceptable only for non-code files or trivial literal lookups.
+
 ## Engineering & TDD Workflow
 
 ### Language
