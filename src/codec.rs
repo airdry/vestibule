@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 /// The rate-limiting classification of an `Item`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ItemCategory {
     Event,
     Transaction,
@@ -134,6 +134,30 @@ impl Envelope {
     /// The parsed `Item`s with their raw header and body bytes.
     pub fn items(&self) -> &[EnvelopeItem] {
         &self.items
+    }
+
+    /// Returns a copy of this envelope keeping only the items whose mask
+    /// entry is `true`. Returns `None` when no items would remain.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `keep` does not have one entry per item.
+    pub fn filter_items(&self, keep: &[bool]) -> Option<Self> {
+        assert_eq!(keep.len(), self.items.len(), "filter mask length mismatch");
+        let items = self
+            .items
+            .iter()
+            .zip(keep)
+            .filter(|(_, keep)| **keep)
+            .map(|(item, _)| EnvelopeItem {
+                header: item.header.clone(),
+                body: item.body.clone(),
+            })
+            .collect::<Vec<_>>();
+        (!items.is_empty()).then(|| Self {
+            header: self.header.clone(),
+            items,
+        })
     }
 
     /// Re-serializes the `Envelope` into a wire-format byte string.
@@ -301,6 +325,28 @@ mod tests {
             Payload::Envelope(Envelope::parse(&serialized).expect("reparse")),
             reparsed
         );
+    }
+
+    #[test]
+    fn filter_items_rebuilds_an_envelope_with_only_kept_items() {
+        let payload = Payload::parse_envelope(&multi_item_envelope());
+        let Payload::Envelope(envelope) = payload else {
+            panic!("expected an envelope payload");
+        };
+
+        // Drop the first (event) item, keep the second (attachment).
+        let filtered = envelope.filter_items(&[false, true]).expect("kept items");
+
+        assert_eq!(filtered.items().len(), 1);
+        let serialized = filtered.to_bytes();
+        let reparsed = Payload::parse_envelope(&serialized);
+        let Payload::Envelope(reparsed) = reparsed else {
+            panic!("filtered envelope must reparse");
+        };
+        assert_eq!(reparsed.items().len(), 1);
+        assert_eq!(reparsed.summaries()[0].category, ItemCategory::Transaction);
+        // Filtering out every item yields None.
+        assert!(envelope.filter_items(&[false, false]).is_none());
     }
 
     #[test]

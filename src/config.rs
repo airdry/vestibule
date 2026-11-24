@@ -4,6 +4,7 @@
 //! schema, validation rules, and the clear startup error messages required
 //! by the specification (`server` and `upstream` are validated here).
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,6 +31,7 @@ pub struct Config {
     pub upstream: UpstreamTarget,
     pub ingest: IngestSettings,
     pub queue: QueueSettings,
+    pub rate_limits: RateLimitSettings,
 }
 
 /// Ingestion pipeline settings applied to `Ingestion Route` requests.
@@ -92,6 +94,39 @@ const DEFAULT_QUEUE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_SEGMENT_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_FSYNC_INTERVAL: Duration = Duration::from_millis(200);
+const DEFAULT_MAX_BUCKETS: usize = 10_000;
+const DEFAULT_BUCKET_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// `Rate Limit Rule` settings: hierarchical rules plus bucket table bounds.
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitSettings {
+    /// Maximum number of concurrently tracked buckets in the LRU/TTL table.
+    pub max_buckets: usize,
+    /// Buckets idle for longer than this TTL may be evicted.
+    pub bucket_ttl: Duration,
+    /// Rules applied when no project-specific rule matches.
+    pub defaults: ScopeRules,
+    /// Rules keyed by numeric `project_id`.
+    pub projects: HashMap<u64, ScopeRules>,
+}
+
+/// `Rate Limit Rule`s for one scope (global defaults or a project).
+#[derive(Debug, Clone, Default)]
+pub struct ScopeRules {
+    pub event: Option<Rule>,
+    pub transaction: Option<Rule>,
+    pub other: Option<Rule>,
+    pub environments: HashMap<String, ScopeRules>,
+}
+
+/// A single `Rate Limit Rule`: refill `rate` in RPS with `burst` capacity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rule {
+    /// Refill rate in requests per second.
+    pub rate: f64,
+    /// Bucket capacity, i.e. the maximum burst of items accepted at once.
+    pub burst: u32,
+}
 
 /// Listener addresses of the two planes inside one process.
 #[derive(Debug, Clone)]
@@ -180,6 +215,7 @@ impl Config {
 
         let ingest = Self::ingest_from_raw(raw.ingest, path)?;
         let queue = Self::queue_from_raw(raw.queue, path)?;
+        let rate_limits = Self::rate_limits_from_raw(raw.rate_limits, path)?;
         Ok(Self {
             server: ServerSettings {
                 data_plane_addr,
@@ -188,6 +224,7 @@ impl Config {
             upstream,
             ingest,
             queue,
+            rate_limits,
         })
     }
 
@@ -283,6 +320,29 @@ impl Config {
             overflow_policy,
             fsync_mode,
             fsync_interval,
+        })
+    }
+
+    fn rate_limits_from_raw(
+        raw: Option<RawRateLimits>,
+        path: &str,
+    ) -> Result<RateLimitSettings, ConfigError> {
+        let raw = raw.unwrap_or_default();
+        let defaults = scope_from_raw(raw.defaults, path)?;
+        let mut projects = HashMap::new();
+        for (project_id, raw_scope) in raw.projects.unwrap_or_default() {
+            projects.insert(project_id, scope_from_raw(Some(raw_scope), path)?);
+        }
+        Ok(RateLimitSettings {
+            max_buckets: raw.max_buckets.unwrap_or(DEFAULT_MAX_BUCKETS),
+            bucket_ttl: non_zero_duration(
+                raw.bucket_ttl,
+                DEFAULT_BUCKET_TTL,
+                "rate_limits.bucket_ttl",
+                path,
+            )?,
+            defaults,
+            projects,
         })
     }
 
@@ -584,6 +644,103 @@ mod tests {
         let error = Config::from_str(&yaml, "<test config>").unwrap_err();
         assert!(error.to_string().contains("max_bytes"));
     }
+
+    #[test]
+    fn parses_rate_limits_settings() {
+        let yaml = format!(
+            "{}\
+             rate_limits:\n\
+             \x20 max_buckets: 100\n\
+             \x20 bucket_ttl: 5m\n\
+             \x20 defaults:\n\
+             \x20 \x20 event:\n\
+             \x20 \x20 \x20 rate: 100.5\n\
+             \x20 \x20 \x20 burst: 200\n\
+             \x20 \x20 environments:\n\
+             \x20 \x20 \x20 production:\n\
+             \x20 \x20 \x20 \x20 transaction:\n\
+             \x20 \x20 \x20 \x20 \x20 rate: 2.5\n\
+             \x20 \x20 \x20 \x20 \x20 burst: 5\n\
+             \x20 projects:\n\
+             \x20 \x20 42:\n\
+             \x20 \x20 \x20 other:\n\
+             \x20 \x20 \x20 \x20 rate: 1\n\
+             \x20 \x20 \x20 \x20 burst: 2\n\
+             \x20 \x20 \x20 environments:\n\
+             \x20 \x20 \x20 \x20 staging:\n\
+             \x20 \x20 \x20 \x20 \x20 event:\n\
+             \x20 \x20 \x20 \x20 \x20 \x20 rate: 0.5\n\
+             \x20 \x20 \x20 \x20 \x20 \x20 burst: 1\n\
+",
+            base_yaml()
+        );
+
+        let config = Config::from_str(&yaml, "<test config>").unwrap();
+        let limits = &config.rate_limits;
+
+        assert_eq!(limits.max_buckets, 100);
+        assert_eq!(limits.bucket_ttl, Duration::from_secs(5 * 60));
+        assert_eq!(
+            limits.defaults.event.as_ref().unwrap(),
+            &Rule {
+                rate: 100.5,
+                burst: 200
+            }
+        );
+        assert_eq!(
+            limits.defaults.environments["production"]
+                .transaction
+                .as_ref()
+                .unwrap(),
+            &Rule {
+                rate: 2.5,
+                burst: 5
+            }
+        );
+        assert_eq!(
+            limits.projects[&42].other.as_ref().unwrap(),
+            &Rule {
+                rate: 1.0,
+                burst: 2
+            }
+        );
+        assert_eq!(
+            limits.projects[&42].environments["staging"]
+                .event
+                .as_ref()
+                .unwrap(),
+            &Rule {
+                rate: 0.5,
+                burst: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limits_default_to_unlimited() {
+        let config = Config::from_str(&base_yaml(), "<test config>").unwrap();
+
+        assert!(config.rate_limits.defaults.event.is_none());
+        assert!(config.rate_limits.projects.is_empty());
+        assert!(config.rate_limits.max_buckets > 0);
+        assert!(config.rate_limits.bucket_ttl > Duration::ZERO);
+    }
+
+    #[test]
+    fn rejects_zero_rate_limit_values() {
+        let yaml = format!(
+            "{}\
+             rate_limits:\n\
+             \x20 defaults:\n\
+             \x20 \x20 event:\n\
+             \x20 \x20 \x20 rate: 0\n\
+             \x20 \x20 \x20 burst: 2\n\
+",
+            base_yaml()
+        );
+        let error = Config::from_str(&yaml, "<test config>").unwrap_err();
+        assert!(error.to_string().contains("rate must be greater than zero"));
+    }
 }
 
 /// The raw (not yet validated) YAML schema.
@@ -594,6 +751,71 @@ struct RawConfig {
     upstream: Option<RawUpstream>,
     ingest: Option<RawIngest>,
     queue: Option<RawQueue>,
+    rate_limits: Option<RawRateLimits>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawRateLimits {
+    max_buckets: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    bucket_ttl: Option<Duration>,
+    defaults: Option<RawScope>,
+    projects: Option<HashMap<u64, RawScope>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawScope {
+    event: Option<RawRule>,
+    transaction: Option<RawRule>,
+    other: Option<RawRule>,
+    environments: Option<HashMap<String, RawScope>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRule {
+    rate: f64,
+    burst: u32,
+}
+
+/// Builds validated `ScopeRules` from the raw YAML scope.
+fn scope_from_raw(raw: Option<RawScope>, path: &str) -> Result<ScopeRules, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(ScopeRules::default());
+    };
+    let rule = |raw: Option<RawRule>| -> Result<Option<Rule>, ConfigError> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        if raw.rate <= 0.0 {
+            return Err(ConfigError::Invalid {
+                path: path.to_string(),
+                message: "rate must be greater than zero".to_string(),
+            });
+        }
+        if raw.burst == 0 {
+            return Err(ConfigError::Invalid {
+                path: path.to_string(),
+                message: "burst must be at least 1".to_string(),
+            });
+        }
+        Ok(Some(Rule {
+            rate: raw.rate,
+            burst: raw.burst,
+        }))
+    };
+    let mut environments = HashMap::new();
+    for (environment, raw_scope) in raw.environments.unwrap_or_default() {
+        environments.insert(environment, scope_from_raw(Some(raw_scope), path)?);
+    }
+    Ok(ScopeRules {
+        event: rule(raw.event)?,
+        transaction: rule(raw.transaction)?,
+        other: rule(raw.other)?,
+        environments,
+    })
 }
 
 #[derive(Debug, Deserialize, Default)]
