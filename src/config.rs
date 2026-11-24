@@ -32,6 +32,26 @@ pub struct Config {
     pub ingest: IngestSettings,
     pub queue: QueueSettings,
     pub rate_limits: RateLimitSettings,
+    pub batch: BatchSettings,
+}
+
+/// Outbound batched delivery settings of the delivery worker pool.
+#[derive(Debug, Clone)]
+pub struct BatchSettings {
+    /// Maximum number of queued envelope records merged into one outbound
+    /// request.
+    pub max_items: usize,
+    /// Upper bound on the accumulated (raw) body bytes of one merged
+    /// outbound request.
+    pub max_bytes: u64,
+    /// Maximum time an incomplete batch waits for more records before
+    /// being flushed.
+    pub flush_interval: Duration,
+    /// Number of concurrent delivery workers.
+    pub workers: usize,
+    /// Drain throttle: upper bound on outbound requests per second
+    /// towards the `Upstream`.
+    pub max_requests_per_sec: f64,
 }
 
 /// Ingestion pipeline settings applied to `Ingestion Route` requests.
@@ -96,6 +116,11 @@ const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_FSYNC_INTERVAL: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BUCKETS: usize = 10_000;
 const DEFAULT_BUCKET_TTL: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_BATCH_MAX_ITEMS: usize = 100;
+const DEFAULT_BATCH_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const DEFAULT_BATCH_WORKERS: usize = 4;
+const DEFAULT_BATCH_MAX_REQUESTS_PER_SEC: f64 = 100.0;
 
 /// `Rate Limit Rule` settings: hierarchical rules plus bucket table bounds.
 #[derive(Debug, Clone, Default)]
@@ -216,6 +241,7 @@ impl Config {
         let ingest = Self::ingest_from_raw(raw.ingest, path)?;
         let queue = Self::queue_from_raw(raw.queue, path)?;
         let rate_limits = Self::rate_limits_from_raw(raw.rate_limits, path)?;
+        let batch = Self::batch_from_raw(raw.batch, path)?;
         Ok(Self {
             server: ServerSettings {
                 data_plane_addr,
@@ -225,6 +251,49 @@ impl Config {
             ingest,
             queue,
             rate_limits,
+            batch,
+        })
+    }
+
+    fn batch_from_raw(raw: Option<RawBatch>, path: &str) -> Result<BatchSettings, ConfigError> {
+        let raw = raw.unwrap_or_default();
+
+        let max_items = positive_usize_or_default(
+            raw.max_items,
+            DEFAULT_BATCH_MAX_ITEMS,
+            "batch.max_items",
+            path,
+        )?;
+        let max_bytes = positive_or_default(
+            raw.max_bytes,
+            DEFAULT_BATCH_MAX_BYTES,
+            "batch.max_bytes",
+            path,
+        )?;
+        let flush_interval = non_zero_duration(
+            raw.flush_interval,
+            DEFAULT_BATCH_FLUSH_INTERVAL,
+            "batch.flush_interval",
+            path,
+        )?;
+        let workers =
+            positive_usize_or_default(raw.workers, DEFAULT_BATCH_WORKERS, "batch.workers", path)?;
+        let max_requests_per_sec = raw
+            .max_requests_per_sec
+            .unwrap_or(DEFAULT_BATCH_MAX_REQUESTS_PER_SEC);
+        if max_requests_per_sec <= 0.0 {
+            return Err(ConfigError::Invalid {
+                path: path.to_string(),
+                message: "batch.max_requests_per_sec must be greater than zero".to_string(),
+            });
+        }
+
+        Ok(BatchSettings {
+            max_items,
+            max_bytes,
+            flush_interval,
+            workers,
+            max_requests_per_sec,
         })
     }
 
@@ -383,6 +452,22 @@ fn positive_or_default(
     name: &str,
     path: &str,
 ) -> Result<u64, ConfigError> {
+    match value {
+        None => Ok(default),
+        Some(0) => Err(ConfigError::Invalid {
+            path: path.to_string(),
+            message: format!("{name} must be greater than zero"),
+        }),
+        Some(value) => Ok(value),
+    }
+}
+
+fn positive_usize_or_default(
+    value: Option<usize>,
+    default: usize,
+    name: &str,
+    path: &str,
+) -> Result<usize, ConfigError> {
     match value {
         None => Ok(default),
         Some(0) => Err(ConfigError::Invalid {
@@ -741,6 +826,51 @@ mod tests {
         let error = Config::from_str(&yaml, "<test config>").unwrap_err();
         assert!(error.to_string().contains("rate must be greater than zero"));
     }
+
+    #[test]
+    fn parses_batch_settings() {
+        let yaml = format!(
+            "{}batch:\n\x20 max_items: 10\n\x20 max_bytes: 1024\n\x20 flush_interval: 250ms\n\x20 workers: 2\n\x20 max_requests_per_sec: 5.5\n",
+            base_yaml()
+        );
+
+        let config = Config::from_str(&yaml, "<test config>").unwrap();
+
+        assert_eq!(config.batch.max_items, 10);
+        assert_eq!(config.batch.max_bytes, 1024);
+        assert_eq!(config.batch.flush_interval, Duration::from_millis(250));
+        assert_eq!(config.batch.workers, 2);
+        assert_eq!(config.batch.max_requests_per_sec, 5.5);
+    }
+
+    #[test]
+    fn applies_default_batch_settings() {
+        let config = Config::from_str(&base_yaml(), "<test config>").unwrap();
+
+        assert_eq!(config.batch.max_items, 100);
+        assert_eq!(config.batch.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(config.batch.flush_interval, Duration::from_millis(100));
+        assert_eq!(config.batch.workers, 4);
+        assert_eq!(config.batch.max_requests_per_sec, 100.0);
+    }
+
+    #[test]
+    fn rejects_invalid_batch_values() {
+        for bad in [
+            "max_items: 0",
+            "max_bytes: 0",
+            "workers: 0",
+            "flush_interval: 0",
+            "max_requests_per_sec: 0",
+        ] {
+            let yaml = format!("{}batch:\n\x20 {bad}\n", base_yaml());
+            let error = Config::from_str(&yaml, "<test config>").unwrap_err();
+            assert!(
+                error.to_string().contains("batch."),
+                "error for {bad} must name the field: {error}"
+            );
+        }
+    }
 }
 
 /// The raw (not yet validated) YAML schema.
@@ -752,6 +882,18 @@ struct RawConfig {
     ingest: Option<RawIngest>,
     queue: Option<RawQueue>,
     rate_limits: Option<RawRateLimits>,
+    batch: Option<RawBatch>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawBatch {
+    max_items: Option<usize>,
+    max_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    flush_interval: Option<Duration>,
+    workers: Option<usize>,
+    max_requests_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Default)]

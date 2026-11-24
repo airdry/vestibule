@@ -54,7 +54,7 @@ pub struct WalRecord {
 }
 
 /// The point in the WAL up to which all records are fully handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position {
     pub segment_id: u64,
     pub offset: u64,
@@ -123,8 +123,11 @@ pub struct Wal {
     active_file: File,
     active_size: u64,
     total_size: u64,
-    /// Consumer position: everything before it is committed.
-    read_pos: Position,
+    /// Durable consumer checkpoint: every record before it is handled.
+    checkpoint: Position,
+    /// In-memory scan cursor pointing at the next record to claim; may
+    /// run ahead of `checkpoint` while claimed records are in flight.
+    scan_pos: Position,
 }
 
 impl Wal {
@@ -151,7 +154,8 @@ impl Wal {
             .len();
 
         let checkpoint = read_checkpoint(dir)?;
-        let (read_pos, truncated) = recover(dir, checkpoint, &segment_ids)?;
+        let (scan_pos, truncated) = recover(dir, checkpoint, &segment_ids)?;
+        let checkpoint = checkpoint.unwrap_or_default();
 
         let wal = Self {
             dir: dir.to_path_buf(),
@@ -168,7 +172,8 @@ impl Wal {
                 active_size
             },
             total_size: total_segment_bytes(dir)?,
-            read_pos,
+            checkpoint,
+            scan_pos,
         };
         wal.persist_checkpoint()?;
         Ok(wal)
@@ -199,24 +204,26 @@ impl Wal {
         Ok(())
     }
 
-    /// Returns the oldest uncommitted record, skipping (and committing past)
-    /// records older than the `max_age` TTL.
+    /// Returns the next unclaimed record, advancing an in-memory scan
+    /// cursor: consecutive claims do not replay each other. Claims are
+    /// finalized only by [`commit`](Self::commit); uncommitted claims replay
+    /// after a reopen, giving at-least-once delivery semantics.
+    /// Records older than the `max_age` TTL are skipped in-memory.
     ///
-    /// `None` means the queue is drained. Records are returned again until
-    /// committed, giving at-least-once delivery semantics.
+    /// `None` means the queue is drained.
     ///
     /// # Errors
     ///
     /// Returns a [`WalError`] when segment files cannot be read.
     pub fn next_record(&mut self) -> Result<Option<PendingRecord>, WalError> {
         loop {
-            let segment_id = match existing_segment_at_or_after(&self.dir, self.read_pos.segment_id)
+            let segment_id = match existing_segment_at_or_after(&self.dir, self.scan_pos.segment_id)
             {
                 Some(segment_id) => segment_id,
                 None => return Ok(None),
             };
-            let offset = if segment_id == self.read_pos.segment_id {
-                self.read_pos.offset
+            let offset = if segment_id == self.scan_pos.segment_id {
+                self.scan_pos.offset
             } else {
                 0
             };
@@ -231,12 +238,19 @@ impl Wal {
                         .saturating_sub(frame.record.enqueued_at_unix_ms)
                         > self.max_age.as_millis() as u64
                     {
-                        self.commit(Position {
+                        // Expired records are skipped in-memory only: the
+                        // durable checkpoint does not move until the record
+                        // would also be re-skipped after a crash.
+                        self.scan_pos = Position {
                             segment_id,
                             offset: frame_end,
-                        })?;
+                        };
                         continue;
                     }
+                    self.scan_pos = Position {
+                        segment_id,
+                        offset: frame_end,
+                    };
                     return Ok(Some(PendingRecord {
                         record: frame.record,
                         position: Position {
@@ -250,7 +264,7 @@ impl Wal {
                     if segment_id == self.active_segment_id {
                         return Ok(None);
                     }
-                    self.read_pos = Position {
+                    self.scan_pos = Position {
                         segment_id: segment_id + 1,
                         offset: 0,
                     };
@@ -262,14 +276,13 @@ impl Wal {
         }
     }
 
-    /// Atomically advances the consumer checkpoint to `position`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`WalError`] when the checkpoint cannot be persisted.
+    /// Atomically advances the consumer checkpoint to `position`. Idempotent
+    /// and monotonic: positions at or before the current checkpoint are
+    /// no-ops, so callers may commit out of order without regressing the
+    /// durable checkpoint.
     pub fn commit(&mut self, position: Position) -> Result<(), WalError> {
-        if position > self.read_pos {
-            self.read_pos = position;
+        if position > self.checkpoint {
+            self.checkpoint = position;
             self.persist_checkpoint()?;
         }
         Ok(())
@@ -309,12 +322,11 @@ impl Wal {
                 .map_err(|source| WalError::io("evict overflowed segment", source))?;
             self.total_size -= size;
 
-            if self.read_pos.segment_id <= oldest {
-                self.read_pos = Position {
+            if self.scan_pos.segment_id <= oldest {
+                self.scan_pos = Position {
                     segment_id: self.active_segment_id,
                     offset: 0,
                 };
-                self.persist_checkpoint()?;
             }
         }
         Ok(())
@@ -324,8 +336,8 @@ impl Wal {
         let tmp_path = self.dir.join(CHECKPOINT_TMP_FILE);
         let mut tmp = File::create(&tmp_path)
             .map_err(|source| WalError::io("create checkpoint temp file", source))?;
-        tmp.write_all(&self.read_pos.segment_id.to_le_bytes())
-            .and_then(|()| tmp.write_all(&self.read_pos.offset.to_le_bytes()))
+        tmp.write_all(&self.checkpoint.segment_id.to_le_bytes())
+            .and_then(|()| tmp.write_all(&self.checkpoint.offset.to_le_bytes()))
             .and_then(|()| tmp.sync_data())
             .map_err(|source| WalError::io("write checkpoint", source))?;
         drop(tmp);
@@ -866,6 +878,14 @@ mod tests {
             .expect("read")
             .expect("fresh record after skip");
         assert_eq!(pending.record.body, record_body(4));
+
+        // The stale skip is not durably committed: an uncommitted claim of
+        // record 4 replays after a reopen, and record 3 is skipped again
+        // (still expired) without resurfacing.
+        drop(wal);
+        let mut wal = Wal::open(&dir, &settings, Arc::clone(&clock) as _).expect("reopen");
+        let replayed = wal.next_record().expect("read").expect("replay");
+        assert_eq!(replayed.record.body, record_body(4));
     }
 
     #[test]
@@ -889,17 +909,35 @@ mod tests {
     }
 
     #[test]
-    fn returns_uncommitted_record_again_for_at_least_once_delivery() {
+    fn claimed_records_replay_after_reopen_until_committed() {
         let dir = tempdir();
         let mut wal =
             Wal::open(&dir, &test_settings(&dir), MockClock::new(1_000)).expect("open wal");
         append_record(&mut wal, 1);
+        append_record(&mut wal, 2);
 
-        let first = wal.next_record().expect("read").expect("first read");
-        let second = wal
-            .next_record()
-            .expect("read")
-            .expect("uncommitted replay");
-        assert_eq!(first, second);
+        // Claims advance sequentially within one run, without committing.
+        let first = wal.next_record().expect("read").expect("first claim");
+        let second = wal.next_record().expect("read").expect("second claim");
+        assert_eq!(first.record.body, record_body(1));
+        assert_eq!(second.record.body, record_body(2));
+        assert!(wal.next_record().expect("read drained").is_none());
+        drop(wal);
+
+        // At-least-once: uncommitted claims replay after a reopen.
+        let mut wal = Wal::open(&dir, &test_settings(&dir), MockClock::new(1_000)).expect("reopen");
+        let replayed = wal.next_record().expect("read").expect("replay");
+        assert_eq!(replayed.record.body, record_body(1));
+        assert_eq!(replayed.position, first.position);
+        wal.commit(replayed.position).expect("commit");
+
+        let second = wal.next_record().expect("read").expect("second");
+        assert_eq!(second.record.body, record_body(2));
+        wal.commit(second.position).expect("commit");
+
+        // Committed records never replay again.
+        drop(wal);
+        let mut wal = Wal::open(&dir, &test_settings(&dir), MockClock::new(1_000)).expect("reopen");
+        assert!(wal.next_record().expect("read").is_none());
     }
 }

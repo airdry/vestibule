@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use support::{MockUpstream, UpstreamResponse, http_client};
 
+use std::io::Read as _;
+
 /// Spins up the service with the given upstream response plan and posts one
 /// ingestion request.
 fn start_delivery(upstream_responses: Vec<UpstreamResponse>) -> (support::TestApp, MockUpstream) {
@@ -36,6 +38,31 @@ fn ingest(app: &support::TestApp, body: &str) {
         )
         .header("Content-Type", "application/json")
         .body(body.to_string())
+        .send()
+        .expect("ingestion request");
+    assert_eq!(response.status().as_u16(), 201);
+}
+
+/// Ingests a valid envelope item on the envelope route.
+fn ingest_envelope(app: &support::TestApp, message: &str, key: &str) {
+    let item = format!("{{\"message\":\"{message}\"}}");
+    let envelope = format!(
+        "{{\"event_id\":\"{}\"}}\n{{\"type\":\"event\",\"length\":{}}}\n{}\n",
+        "11111111111111111111111111111111",
+        item.len(),
+        item
+    );
+    let response = http_client()
+        .post(format!(
+            "{}/api/42/envelope/?sentry_key={key}",
+            app.data_plane_url
+        ))
+        .header(
+            "X-Sentry-Auth",
+            format!("Sentry sentry_key={key}, sentry_version=7"),
+        )
+        .header("Content-Type", "application/x-sentry-envelope")
+        .body(envelope)
         .send()
         .expect("ingestion request");
     assert_eq!(response.status().as_u16(), 201);
@@ -128,8 +155,15 @@ fn unrecoverable_4xx_drops_the_record_and_does_not_block_the_queue() {
         2,
         "the rejected record must be dropped after one attempt"
     );
-    assert_eq!(requests[0].body, b"bad payload".to_vec());
-    assert_eq!(requests[1].body, b"good payload".to_vec());
+    let mut delivered: Vec<&[u8]> = requests
+        .iter()
+        .map(|request| request.body.as_slice())
+        .collect();
+    delivered.sort();
+    assert_eq!(
+        delivered,
+        [b"bad payload".as_slice(), b"good payload".as_slice()]
+    );
 }
 
 #[test]
@@ -162,4 +196,101 @@ fn upstream_timeout_is_retried_and_delivered_on_the_next_attempt() {
     wait_until(|| upstream.recorded_requests().len() >= 2);
     let requests = upstream.recorded_requests();
     assert!(requests.iter().any(|r| r.body == b"payload".to_vec()));
+}
+
+#[test]
+fn compatible_envelopes_are_merged_into_one_gzip_request() {
+    let upstream = MockUpstream::start(UpstreamResponse::ok("ignored"));
+    let config = support::config_yaml_with(
+        &upstream.url(),
+        support::ephemeral_port(),
+        support::ephemeral_port(),
+        "batch:\n  max_items: 2\n",
+    );
+    let app = support::start_service(&config);
+
+    ingest_envelope(&app, "first", "abc123");
+    ingest_envelope(&app, "second", "abc123");
+
+    wait_until(|| !upstream.recorded_requests().is_empty());
+    // Give the second record a chance to join the same batch.
+    std::thread::sleep(Duration::from_millis(300));
+    let requests = upstream.recorded_requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "both records must merge into one request"
+    );
+    let request = &requests[0];
+    assert_eq!(request.path, "/api/42/envelope/?sentry_key=abc123");
+    assert_eq!(
+        request.header("content-type"),
+        Some("application/x-sentry-envelope")
+    );
+    assert_eq!(request.header("content-encoding"), Some("gzip"));
+
+    let mut decoder = flate2::read::GzDecoder::new(&request.body[..]);
+    let mut body = Vec::new();
+    decoder
+        .read_to_end(&mut body)
+        .expect("gunzip merged envelope");
+    let text = String::from_utf8(body).expect("envelope is utf8");
+    assert!(text.contains("\"first\""), "merged body: {text}");
+    assert!(text.contains("\"second\""), "merged body: {text}");
+}
+
+#[test]
+fn different_sentry_keys_are_never_merged() {
+    let upstream = MockUpstream::start(UpstreamResponse::ok("ignored"));
+    let config = support::config_yaml_with(
+        &upstream.url(),
+        support::ephemeral_port(),
+        support::ephemeral_port(),
+        "batch:\n  max_items: 4\n",
+    );
+    let app = support::start_service(&config);
+
+    ingest_envelope(&app, "first", "abc123");
+    ingest_envelope(&app, "second", "def456");
+
+    wait_until(|| upstream.recorded_requests().len() >= 2);
+    let requests = upstream.recorded_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "records with different keys must not merge"
+    );
+    let keys: Vec<&str> = requests
+        .iter()
+        .map(|request| request.path.split("sentry_key=").nth(1))
+        .collect::<Option<Vec<&str>>>()
+        .expect("recorded requests carry the sentry_key parameter");
+    let mut keys = keys;
+    keys.sort();
+    assert_eq!(keys, ["abc123", "def456"]);
+}
+
+#[test]
+fn a_single_envelope_record_is_flushed_after_flush_interval() {
+    let upstream = MockUpstream::start(UpstreamResponse::ok("ignored"));
+    let config = support::config_yaml_with(
+        &upstream.url(),
+        support::ephemeral_port(),
+        support::ephemeral_port(),
+        "batch:\n  max_items: 100\n  flush_interval: 50ms\n",
+    );
+    let app = support::start_service(&config);
+
+    ingest_envelope(&app, "single", "abc123");
+
+    wait_until(|| !upstream.recorded_requests().is_empty());
+    let requests = upstream.recorded_requests();
+    assert_eq!(requests.len(), 1, "exactly one flush must happen");
+    let request = &requests[0];
+    assert_eq!(request.path, "/api/42/envelope/?sentry_key=abc123");
+    assert!(
+        request.header("content-encoding").is_none(),
+        "a single-record batch is forwarded verbatim"
+    );
+    assert!(String::from_utf8_lossy(&request.body).contains("\"single\""));
 }

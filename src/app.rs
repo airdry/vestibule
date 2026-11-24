@@ -15,7 +15,7 @@ use pingora::proxy::http_proxy_service_with_name;
 use crate::admin_plane::AdminPlane;
 use crate::config::{Config, FsyncMode};
 use crate::data_plane::DataPlaneProxy;
-use crate::delivery::{DeliveryWorker, RetryPolicy};
+use crate::delivery::{DeliveryPool, RetryPolicy};
 use crate::ingestion::{IngestionPipeline, lock_wal};
 use crate::rate_limit::RateLimiter;
 use crate::wal::{SystemClock, Wal};
@@ -72,10 +72,11 @@ pub fn run(config: Config) -> Result<Infallible, AppError> {
         http_proxy_service_with_name(&server.configuration, AdminPlane, "Admin Plane");
     admin_plane.add_tcp(&config.server.admin_addr.to_string());
 
-    let delivery_worker = DeliveryWorker::new(
+    let delivery_worker = DeliveryPool::new(
         Arc::clone(&wal),
         config.upstream.clone(),
         RetryPolicy::default(),
+        config.batch.clone(),
     )
     .map_err(|message| AppError::ServerInit { message })?;
     server.add_service(background_service("Delivery Worker", delivery_worker));

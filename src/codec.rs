@@ -183,6 +183,36 @@ impl Envelope {
         }
         bytes
     }
+
+    /// Merges compatible envelopes into one combined `Envelope`.
+    ///
+    /// Items keep their arrival order. A merge of several envelopes drops
+    /// the per-envelope headers (an `event_id` header would be ambiguous
+    /// across merged events); a merge of a single envelope preserves it
+    /// unchanged. Items without an explicit `length` get one injected so
+    /// that a lengthless item no longer swallows the following items.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `envelopes` is empty.
+    pub fn merge(envelopes: &[Self]) -> Self {
+        assert!(
+            !envelopes.is_empty(),
+            "merging requires at least one envelope"
+        );
+        if envelopes.len() == 1 {
+            return envelopes[0].clone();
+        }
+        let items = envelopes
+            .iter()
+            .flat_map(Self::items)
+            .map(EnvelopeItem::with_explicit_length)
+            .collect();
+        Self {
+            header: b"{}".to_vec(),
+            items,
+        }
+    }
 }
 
 impl EnvelopeItem {
@@ -192,6 +222,21 @@ impl EnvelopeItem {
             Some("event") => ItemCategory::Event,
             Some("transaction") => ItemCategory::Transaction,
             _ => ItemCategory::Other,
+        }
+    }
+
+    /// Returns a copy whose header carries an explicit `length` matching
+    /// the body, so the item cannot swallow what follows it.
+    fn with_explicit_length(&self) -> Self {
+        let Some(mut header) = parse_json(&self.header) else {
+            return self.clone();
+        };
+        if header.get("length").is_none() {
+            header["length"] = Value::from(self.body.len() as u64);
+        }
+        Self {
+            header: serde_json::to_vec(&header).unwrap_or_else(|_| self.header.clone()),
+            body: self.body.clone(),
         }
     }
 }
@@ -358,6 +403,121 @@ mod tests {
         assert_eq!(reparsed.summaries()[0].category, ItemCategory::Transaction);
         // Filtering out every item yields None.
         assert!(envelope.filter_items(&[false, false]).is_none());
+    }
+
+    /// Two envelopes sharing one `(project_id, credentials)` merge key,
+    /// with mixed item types and one binary attachment body.
+    fn envelope_with(id: &str, item_type: &str, body: &[u8]) -> Vec<u8> {
+        let header = format!("{{\"event_id\":\"{id}\"}}");
+        let item_header = format!("{{\"type\":\"{item_type}\",\"length\":{{LEN}}}}");
+        envelope(&header, &[(&item_header, body)])
+    }
+
+    #[test]
+    fn merge_combines_items_of_multiple_envelopes() {
+        let first = Payload::parse_envelope(&envelope_with(
+            "id-1",
+            "event",
+            br#"{"environment":"production","message":"boom"}"#,
+        ));
+        let second = Payload::parse_envelope(&envelope_with(
+            "id-2",
+            "transaction",
+            br#"{"environment":"staging","trace_id":"abc"}"#,
+        ));
+        let (Payload::Envelope(first), Payload::Envelope(second)) = (first, second) else {
+            panic!("expected envelope payloads");
+        };
+
+        let merged = Envelope::merge(&[first, second]);
+
+        // The merged envelope drops per-event headers (event_id would be
+        // ambiguous) and keeps every item in arrival order.
+        assert_eq!(merged.event_id(), None);
+        assert_eq!(merged.items().len(), 2);
+        let summaries = merged.summaries();
+        assert_eq!(summaries[0].category, ItemCategory::Event);
+        assert_eq!(summaries[1].category, ItemCategory::Transaction);
+
+        let serialized = merged.to_bytes();
+        let reparsed = Payload::parse_envelope(&serialized);
+        let Payload::Envelope(reparsed) = reparsed else {
+            panic!("merged envelope must reparse");
+        };
+        assert_eq!(reparsed.items().len(), 2);
+        assert_eq!(reparsed.summaries()[0].category, ItemCategory::Event);
+        assert_eq!(reparsed.summaries()[1].category, ItemCategory::Transaction);
+    }
+
+    #[test]
+    fn merge_preserves_binary_attachments_and_item_order() {
+        let attachment_body: &[u8] = &[0x00, b'\n', 0xff, b'\r', 0x42];
+        let first = Payload::parse_envelope(&envelope_with("id-1", "event", b"{}"));
+        let second = Payload::parse_envelope(&envelope_with("id-2", "attachment", attachment_body));
+        let (Payload::Envelope(first), Payload::Envelope(second)) = (first, second) else {
+            panic!("expected envelope payloads");
+        };
+
+        let merged = Envelope::merge(&[first, second]);
+        let serialized = merged.to_bytes();
+        let Payload::Envelope(reparsed) = Payload::parse_envelope(&serialized) else {
+            panic!("merged envelope must reparse");
+        };
+
+        assert_eq!(reparsed.items().len(), 2);
+        assert_eq!(reparsed.summaries()[1].category, ItemCategory::Other);
+        // Binary bytes survive the merge byte-for-byte.
+        let items = reparsed.items();
+        assert_eq!(items[1].body, attachment_body);
+    }
+
+    #[test]
+    fn merge_injects_length_into_lengthless_items() {
+        // A lengthless item consumes the rest of its envelope, so it can only
+        // be last within its source envelope; merging must inject an explicit
+        // `length` so it stops before the following envelope's items.
+        let first = b"{\"event_id\":\"id-1\"}\n{\"type\":\"attachment\"}\nbinary-attachment\n";
+        let second = b"{\"event_id\":\"id-2\"}\n{\"type\":\"event\",\"length\":2}\n{}\n";
+        let first = Payload::parse_envelope(first);
+        let second = Payload::parse_envelope(second);
+        let (Payload::Envelope(first), Payload::Envelope(second)) = (first, second) else {
+            panic!("expected envelope payloads");
+        };
+        assert_eq!(
+            first.items().len(),
+            1,
+            "fixture must be one lengthless item"
+        );
+        // The codec treats the trailing separator as part of a lengthless
+        // item's body; the merge must preserve that body byte-for-byte.
+        let lengthless_body = first.items()[0].body.clone();
+
+        let merged = Envelope::merge(&[first, second]);
+        assert_eq!(merged.items().len(), 2);
+
+        let serialized = merged.to_bytes();
+        let Payload::Envelope(reparsed) = Payload::parse_envelope(&serialized) else {
+            panic!("merged envelope must reparse");
+        };
+        assert_eq!(reparsed.items().len(), 2);
+        assert_eq!(reparsed.items()[0].body, lengthless_body);
+        assert_eq!(reparsed.items()[1].body, b"{}");
+    }
+
+    #[test]
+    fn merge_of_a_single_envelope_preserves_it_unchanged() {
+        let payload = Payload::parse_envelope(&multi_item_envelope());
+        let Payload::Envelope(envelope) = payload else {
+            panic!("expected an envelope payload");
+        };
+
+        let merged = Envelope::merge(std::slice::from_ref(&envelope));
+
+        assert_eq!(merged, envelope);
+        assert_eq!(
+            merged.event_id().as_deref(),
+            Some("84df5a5f-51d8-409a-9416-a1adb4b0e3d0")
+        );
     }
 
     #[test]

@@ -71,6 +71,46 @@ impl ForwardedMetadata {
         }
         metadata
     }
+
+    /// The normalized `sentry_key` credential carried by this request: from
+    /// the `X-Sentry-Auth` header when present, otherwise from the
+    /// `sentry_key` query parameter. `None` marks requests without a
+    /// recognizable credential.
+    pub fn sentry_key(&self) -> Option<&str> {
+        let auth_header = self
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-sentry-auth"))
+            .map(|(_, value)| value.as_str());
+        if let Some(value) = auth_header {
+            return sentry_key_from_auth_header(value);
+        }
+        sentry_key_from_query(&self.query)
+    }
+}
+
+/// Extracts `sentry_key` from an `X-Sentry-Auth` header value such as
+/// `"Sentry sentry_key=abc, sentry_version=7"`. Parameter names match
+/// case-insensitively; the value is returned verbatim.
+fn sentry_key_from_auth_header(value: &str) -> Option<&str> {
+    value
+        .trim_start_matches("Sentry")
+        .split(',')
+        .map(str::trim)
+        .find_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("sentry_key")
+                .then_some(value.trim())
+        })
+}
+
+/// Extracts the `sentry_key` query parameter value, if present.
+fn sentry_key_from_query(query: &str) -> Option<&str> {
+    query.split('&').find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.eq_ignore_ascii_case("sentry_key").then_some(value)
+    })
 }
 
 /// Locks the `Ingestion Queue`, tolerating lock poisoning: the queue state
@@ -388,6 +428,65 @@ mod tests {
     #[test]
     fn decodes_empty_metadata() {
         assert_eq!(ForwardedMetadata::decode(""), ForwardedMetadata::default());
+    }
+
+    #[test]
+    fn sentry_key_is_extracted_from_the_auth_header() {
+        let metadata = ForwardedMetadata {
+            query: String::new(),
+            headers: vec![(
+                "x-sentry-auth".into(),
+                "Sentry sentry_key=abc123, sentry_version=7".into(),
+            )],
+        };
+
+        assert_eq!(metadata.sentry_key(), Some("abc123"));
+    }
+
+    #[test]
+    fn sentry_key_falls_back_to_the_query_parameter() {
+        let metadata = ForwardedMetadata {
+            query: "sentry_version=7&sentry_key=abc123".into(),
+            headers: vec![],
+        };
+
+        assert_eq!(metadata.sentry_key(), Some("abc123"));
+    }
+
+    #[test]
+    fn sentry_key_matching_is_case_insensitive_on_names_only() {
+        // The auth header wins over the query; parameter order does not
+        // matter and parameter names are matched case-insensitively, but the
+        // key value itself is compared verbatim.
+        let header_only = ForwardedMetadata {
+            query: String::new(),
+            headers: vec![(
+                "x-sentry-auth".into(),
+                "Sentry SENTRY_VERSION=7, sentry_key=Key-Value".into(),
+            )],
+        };
+        assert_eq!(header_only.sentry_key(), Some("Key-Value"));
+
+        let query_only = ForwardedMetadata {
+            query: "SENTRY_KEY=query-key".into(),
+            headers: vec![],
+        };
+        assert_eq!(query_only.sentry_key(), Some("query-key"));
+    }
+
+    #[test]
+    fn sentry_key_is_none_without_credentials() {
+        let neither = ForwardedMetadata {
+            query: "sentry_version=7".into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+        };
+        assert_eq!(neither.sentry_key(), None);
+
+        let auth_without_key = ForwardedMetadata {
+            query: String::new(),
+            headers: vec![("x-sentry-auth".into(), "Sentry sentry_version=7".into())],
+        };
+        assert_eq!(auth_without_key.sentry_key(), None);
     }
 
     struct MockClock(std::sync::Mutex<u64>);

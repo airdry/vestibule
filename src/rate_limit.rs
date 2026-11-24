@@ -281,6 +281,7 @@ mod tests {
         // Touch two more buckets; the project-1 bucket becomes the LRU
         // entry and is evicted once the table reaches capacity. Distinct
         // `last_used_ms` values make the LRU order deterministic.
+        clock.advance_ms(1);
         limiter.check(item(RATE_1_RPS, Some(2), "prod"));
         clock.advance_ms(1);
         limiter.check(item(RATE_1_RPS, Some(3), "prod"));
