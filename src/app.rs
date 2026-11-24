@@ -17,6 +17,7 @@ use crate::config::{Config, FsyncMode};
 use crate::data_plane::DataPlaneProxy;
 use crate::delivery::{DeliveryWorker, RetryPolicy};
 use crate::ingestion::{IngestionPipeline, lock_wal};
+use crate::rate_limit::RateLimiter;
 use crate::wal::{SystemClock, Wal};
 
 /// Errors while assembling or starting the server.
@@ -48,7 +49,17 @@ pub fn run(config: Config) -> Result<Infallible, AppError> {
             }
         })?;
     let wal = Arc::new(Mutex::new(wal));
-    let ingestion = IngestionPipeline::new(Arc::clone(&wal), config.ingest.clone());
+    let rate_limiter = Arc::new(RateLimiter::new(
+        Arc::new(SystemClock),
+        config.rate_limits.max_buckets,
+        config.rate_limits.bucket_ttl,
+    ));
+    let ingestion = IngestionPipeline::new(
+        Arc::clone(&wal),
+        config.ingest.clone(),
+        Arc::clone(&rate_limiter),
+        Arc::new(config.rate_limits.clone()),
+    );
 
     let mut data_plane = http_proxy_service_with_name(
         &server.configuration,

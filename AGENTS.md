@@ -16,7 +16,15 @@ Single-context: one `GLOSSARY.md` and one `docs/adr/` at the repo root. See `doc
 
 ### Code search
 
+<!-- Search tool priority rule:
+     Always prefer `rg` (ripgrep) or `ast-grep` over plain `grep`. Fallback to
+     `grep` ONLY if ripgrep or ast-grep is unavailable or misbehaves in the
+     current environment. Rationale: rg respects .gitignore, skips binaries,
+     and is faster; ast-grep understands code structure (AST) instead of raw
+     text, so pattern searches don't produce false positives. -->
+
 - Use the `ast-grep` skill for code search and structural queries instead of plain `grep`/`rg` when looking for code patterns, specific language constructs, or performing complex code queries. Plain text search is acceptable only for non-code files or trivial literal lookups.
+- **Priority rule**: every time you are about to run `grep`, use `rg` (ripgrep) or `ast-grep` instead. Use plain `grep` only as a fallback when ripgrep or ast-grep do not work correctly in the given context (unavailable, broken, or producing wrong results).
 
 ## Engineering & TDD Workflow
 

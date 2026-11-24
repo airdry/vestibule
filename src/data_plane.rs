@@ -7,7 +7,9 @@ use pingora::proxy::{ProxyHttp, Session};
 use crate::codec::Payload;
 use crate::config::UpstreamTarget;
 use crate::decompression::{DecompressError, DecompressedBody, decompress};
-use crate::ingestion::{self, ForwardedMetadata, IngestionOutcome, IngestionPipeline};
+use crate::ingestion::{
+    self, ForwardedMetadata, IngestionOutcome, IngestionPipeline, RateLimitDecision,
+};
 
 /// Pingora proxy that forwards `Pass-Through Traffic` to the configured
 /// `Upstream` and intercepts `Ingestion Route` requests into the local
@@ -39,12 +41,26 @@ impl ProxyHttp for DataPlaneProxy {
 
         let outcome = ingest(&self.ingestion, session).await?;
         match outcome {
-            IngestionOutcome::Accepted(event_id) => {
-                acknowledge_ingestion(session, self.ingestion.success_status_code(), event_id)
-                    .await?;
+            IngestionOutcome::Accepted {
+                event_id,
+                rate_limits,
+            } => {
+                acknowledge_ingestion(
+                    session,
+                    self.ingestion.success_status_code(),
+                    event_id,
+                    rate_limits.as_deref(),
+                )
+                .await?;
             }
             IngestionOutcome::PayloadTooLarge => {
                 session.respond_error(413).await?;
+            }
+            IngestionOutcome::Throttled {
+                rate_limits,
+                retry_after,
+            } => {
+                respond_throttled(session, &rate_limits, retry_after).await?;
             }
         }
         Ok(true)
@@ -89,30 +105,66 @@ async fn ingest(pipeline: &IngestionPipeline, session: &mut Session) -> Result<I
     };
     session.as_downstream_mut().finish_body().await?;
 
-    let event_id = match inspect_body(
+    let payload = match inspect_body(
         &route,
         content_encoding(session),
         &body,
         pipeline.max_decompressed_body_bytes(),
     ) {
-        Inspection::Accepted(event_id) => event_id,
+        Inspection::Accepted(payload) => payload,
         Inspection::TooLarge => return Ok(IngestionOutcome::PayloadTooLarge),
     };
+    let event_id = match &payload {
+        Payload::Envelope(envelope) => envelope.event_id(),
+        Payload::StoreEvent { .. } | Payload::Unrecognized => None,
+    };
 
-    pipeline.accept(&route, &auth, &body).map_err(|error| {
+    // Rate limiting: rebuilt envelopes replace the original bytes, so the
+    // forwarded `content-encoding` header must be dropped for them.
+    let (body, auth) = match pipeline.evaluate(&route, &payload) {
+        RateLimitDecision::Allowed => (body, auth),
+        RateLimitDecision::PartiallyDenied { body, rate_limits } => {
+            let auth = ingestion::strip_content_encoding(&auth);
+            accept(pipeline, &route, &auth, &body)?;
+            return Ok(IngestionOutcome::Accepted {
+                event_id,
+                rate_limits: Some(rate_limits),
+            });
+        }
+        RateLimitDecision::FullyDenied {
+            rate_limits,
+            retry_after,
+        } => {
+            return Ok(IngestionOutcome::Throttled {
+                rate_limits,
+                retry_after,
+            });
+        }
+    };
+
+    accept(pipeline, &route, &auth, &body)?;
+    Ok(IngestionOutcome::Accepted {
+        event_id,
+        rate_limits: None,
+    })
+}
+
+/// Appends a record to the `Ingestion Queue`, mapping WAL errors to
+/// internal Pingora errors.
+fn accept(pipeline: &IngestionPipeline, route: &str, auth: &str, body: &[u8]) -> Result<()> {
+    pipeline.accept(route, auth, body).map_err(|error| {
         pingora::Error::because(
             InternalError,
             format!("ingestion queue append failed: {error}"),
             error,
         )
-    })?;
-    Ok(IngestionOutcome::Accepted(event_id))
+    })
 }
 
 /// The result of decompressing and parsing an ingestion body.
 enum Inspection {
-    /// The body is acceptable; carries the envelope header `event_id`.
-    Accepted(Option<String>),
+    /// The body is acceptable; carries the parsed payload.
+    Accepted(Payload),
     /// The decompressed body exceeded `ingest.max_decompressed_body_bytes`.
     TooLarge,
 }
@@ -134,11 +186,7 @@ fn inspect_body(
         Err(DecompressError::Corrupt) => body.to_vec(),
     };
 
-    let event_id = match parse_payload(route, &decompressed) {
-        Payload::Envelope(envelope) => envelope.event_id(),
-        Payload::StoreEvent { .. } | Payload::Unrecognized => None,
-    };
-    Inspection::Accepted(event_id)
+    Inspection::Accepted(parse_payload(route, &decompressed))
 }
 
 /// Parses the body according to the `Ingestion Route` shape.
@@ -216,11 +264,13 @@ async fn read_limited_body(
 }
 
 /// Immediately acknowledges the SDK with the configured success status and
-/// an empty or `event_id`-bearing JSON body.
+/// an empty or `event_id`-bearing JSON body, attaching rate limit
+/// information when any item was throttled.
 async fn acknowledge_ingestion(
     session: &mut Session,
     status: u16,
     event_id: Option<String>,
+    rate_limits: Option<&str>,
 ) -> Result<()> {
     let body = match event_id {
         Some(event_id) => serde_json::json!({ "id": event_id }).to_string(),
@@ -231,11 +281,36 @@ async fn acknowledge_ingestion(
     response
         .insert_header("Content-Type", "application/json")
         .or_err(InternalError, "failed to set the ingestion response type")?;
+    if let Some(rate_limits) = rate_limits {
+        response
+            .insert_header("X-Sentry-Rate-Limits", rate_limits)
+            .or_err(InternalError, "failed to set the rate limits header")?;
+    }
     session
         .write_response_header(Box::new(response), false)
         .await?;
     session
         .write_response_body(Some(Bytes::from(body)), true)
+        .await
+}
+
+/// Rejects a fully throttled request with `429 Too Many Requests` and the
+/// `X-Sentry-Rate-Limits` / `Retry-After` headers.
+async fn respond_throttled(
+    session: &mut Session,
+    rate_limits: &str,
+    retry_after: u64,
+) -> Result<()> {
+    let mut response = ResponseHeader::build(429, Some(2))
+        .or_err(InternalError, "failed to build the throttled response")?;
+    response
+        .insert_header("X-Sentry-Rate-Limits", rate_limits)
+        .or_err(InternalError, "failed to set the rate limits header")?;
+    response
+        .insert_header("Retry-After", retry_after.to_string())
+        .or_err(InternalError, "failed to set the retry-after header")?;
+    session
+        .write_response_header(Box::new(response), true)
         .await
 }
 

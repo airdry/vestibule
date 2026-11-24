@@ -16,6 +16,17 @@ pub enum ItemCategory {
     Other,
 }
 
+impl ItemCategory {
+    /// The wire name used in `X-Sentry-Rate-Limits` entries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ItemCategory::Event => "event",
+            ItemCategory::Transaction => "transaction",
+            ItemCategory::Other => "other",
+        }
+    }
+}
+
 /// Per-item metadata extracted by the codec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemSummary {
