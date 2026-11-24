@@ -46,6 +46,7 @@ Follow the curated Rust quality gates from `https://github.com/mokevnin/dev-qual
 - Work one ticket at a time from `.scratch/sentry-ratelimiter/issues/NN-*.md` in dependency order (`Blocked by`).
 - Never commit `.scratch/` (it is gitignored and kept local only).
 - After completing a ticket, check off its acceptance criteria and set `Status: resolved` in its local ticket file, then run `code-review` against the ticket and `AGENTS.md` before moving on.
+- After finishing a ticket (and after heavy `cargo` usage), clean the build artifacts: run `cargo clean` so the `target/` directory does not accumulate thousands of small build files that do not belong in the project.
 
 <!-- Add project-specific implementation rules below before starting Ticket 01 -->
 

@@ -50,9 +50,12 @@ impl Payload {
 
     /// Parses a legacy `/store/` JSON body as a single `event` `Item`.
     pub fn parse_store_event(bytes: &[u8]) -> Payload {
-        match environment_of_json(bytes) {
-            Some(environment) => Payload::StoreEvent { environment },
-            None => Payload::Unrecognized,
+        match parse_json(bytes) {
+            Some(Value::Object(_)) => Payload::StoreEvent {
+                environment: environment_of_json(bytes)
+                    .unwrap_or_else(|| UNKNOWN_ENVIRONMENT.into()),
+            },
+            _ => Payload::Unrecognized,
         }
     }
 }
@@ -308,6 +311,16 @@ mod tests {
             payload,
             Payload::StoreEvent {
                 environment: "production".into()
+            }
+        );
+    }
+
+    #[test]
+    fn store_json_without_environment_is_still_an_event() {
+        assert_eq!(
+            Payload::parse_store_event(br#"{"event_id":42}"#),
+            Payload::StoreEvent {
+                environment: "unknown".into()
             }
         );
     }

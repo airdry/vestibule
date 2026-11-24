@@ -223,7 +223,7 @@ async fn acknowledge_ingestion(
     event_id: Option<String>,
 ) -> Result<()> {
     let body = match event_id {
-        Some(event_id) => format!("{{\"id\":\"{event_id}\"}}"),
+        Some(event_id) => serde_json::json!({ "id": event_id }).to_string(),
         None => "{}".to_string(),
     };
     let mut response = ResponseHeader::build(status, Some(2))
