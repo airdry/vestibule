@@ -1,0 +1,326 @@
+//! Sentry Wire Codec: parses and re-serializes Sentry `Envelope` payloads
+//! and legacy `/store/` JSON bodies, classifying each `Item` into an
+//! `Item Category` and extracting `environment` metadata.
+//!
+//! Parsing never rejects a payload: unrecognized or corrupted bodies are
+//! reported as [`Payload::Unrecognized`] so ingestion can fail open and
+//! forward the raw bytes.
+
+use serde_json::Value;
+
+/// The rate-limiting classification of an `Item`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemCategory {
+    Event,
+    Transaction,
+    Other,
+}
+
+/// Per-item metadata extracted by the codec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemSummary {
+    pub category: ItemCategory,
+    /// Item `environment` extracted from JSON item bodies, `"unknown"` when
+    /// absent.
+    pub environment: String,
+}
+
+const UNKNOWN_ENVIRONMENT: &str = "unknown";
+
+/// What the codec recognized in an ingestion payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Payload {
+    /// A multi-line Sentry `Envelope`.
+    Envelope(Envelope),
+    /// A legacy `/store/` JSON body treated as a single `event` `Item`.
+    StoreEvent { environment: String },
+    /// Anything the codec cannot understand; ingestion must fail open and
+    /// forward the raw bytes.
+    Unrecognized,
+}
+
+impl Payload {
+    /// Parses an `Envelope` body (`\n`-separated header/item lines).
+    pub fn parse_envelope(bytes: &[u8]) -> Payload {
+        match Envelope::parse(bytes) {
+            Ok(envelope) => Payload::Envelope(envelope),
+            Err(EnvelopeError) => Payload::Unrecognized,
+        }
+    }
+
+    /// Parses a legacy `/store/` JSON body as a single `event` `Item`.
+    pub fn parse_store_event(bytes: &[u8]) -> Payload {
+        match environment_of_json(bytes) {
+            Some(environment) => Payload::StoreEvent { environment },
+            None => Payload::Unrecognized,
+        }
+    }
+}
+
+/// Why an `Envelope` could not be parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnvelopeError;
+
+/// A parsed Sentry `Envelope`: raw header line plus parsed `Item`s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Envelope {
+    header: Vec<u8>,
+    items: Vec<EnvelopeItem>,
+}
+
+/// One parsed `Item`: its raw header line and raw body bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvelopeItem {
+    header: Vec<u8>,
+    body: Vec<u8>,
+}
+
+impl Envelope {
+    fn parse(bytes: &[u8]) -> Result<Self, EnvelopeError> {
+        let (header, mut rest) = split_line(bytes).ok_or(EnvelopeError)?;
+        ensure_json_object(header)?;
+        let mut items = Vec::new();
+        while !rest.is_empty() {
+            let (item_header, item_rest) = split_line(rest).ok_or(EnvelopeError)?;
+            let header = parse_json(item_header).ok_or(EnvelopeError)?;
+            let length = optional_length(&header)?;
+            let (body, remainder) = match length {
+                Some(length) => {
+                    let (body, remainder) = item_rest
+                        .split_at_checked(length)
+                        .map(|(body, remainder)| (body.to_vec(), remainder))
+                        .ok_or(EnvelopeError)?;
+                    // A length-delimited `Item` body is followed by an
+                    // optional newline before the next `Item` header.
+                    let remainder = remainder.strip_prefix(b"\n").unwrap_or(remainder);
+                    (body, remainder)
+                }
+                None => (item_rest.to_vec(), &[][..]),
+            };
+            rest = remainder;
+            items.push(EnvelopeItem {
+                header: item_header.to_vec(),
+                body,
+            });
+        }
+        Ok(Self {
+            header: header.to_vec(),
+            items,
+        })
+    }
+
+    /// The envelope header's `event_id`, if present.
+    pub fn event_id(&self) -> Option<String> {
+        parse_json(&self.header)
+            .and_then(|header| header.get("event_id").cloned())
+            .and_then(|value| value.as_str().map(str::to_string))
+    }
+
+    /// Per-item category and environment summaries.
+    pub fn summaries(&self) -> Vec<ItemSummary> {
+        self.items
+            .iter()
+            .map(|item| ItemSummary {
+                category: item.category(),
+                environment: environment_of_json(&item.body)
+                    .unwrap_or_else(|| UNKNOWN_ENVIRONMENT.into()),
+            })
+            .collect()
+    }
+
+    /// The parsed `Item`s with their raw header and body bytes.
+    pub fn items(&self) -> &[EnvelopeItem] {
+        &self.items
+    }
+
+    /// Re-serializes the `Envelope` into a wire-format byte string.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.header.clone();
+        bytes.push(b'\n');
+        for item in &self.items {
+            bytes.extend_from_slice(&item.header);
+            bytes.push(b'\n');
+            bytes.extend_from_slice(&item.body);
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+}
+
+impl EnvelopeItem {
+    fn category(&self) -> ItemCategory {
+        let item_type = parse_json(&self.header).and_then(|header| header.get("type").cloned());
+        match item_type.as_ref().and_then(Value::as_str) {
+            Some("event") => ItemCategory::Event,
+            Some("transaction") => ItemCategory::Transaction,
+            _ => ItemCategory::Other,
+        }
+    }
+}
+
+/// Splits the leading line (up to and excluding `\n`) from the rest.
+fn split_line(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let newline = bytes.iter().position(|&byte| byte == b'\n')?;
+    let (line, rest) = bytes.split_at(newline);
+    Some((line, &rest[1..]))
+}
+
+/// Parses bytes as a JSON value, returning `None` on any parse failure.
+fn parse_json(bytes: &[u8]) -> Option<Value> {
+    serde_json::from_slice(bytes).ok()
+}
+
+/// `true` when the bytes parse as a JSON object (map).
+fn ensure_json_object(bytes: &[u8]) -> Result<(), EnvelopeError> {
+    match parse_json(bytes) {
+        Some(Value::Object(_)) => Ok(()),
+        _ => Err(EnvelopeError),
+    }
+}
+
+/// Reads the optional non-negative integer `length` field from an item
+/// header, failing on non-integer or negative values.
+fn optional_length(header: &Value) -> Result<Option<usize>, EnvelopeError> {
+    match header.get("length") {
+        None => Ok(None),
+        Some(Value::Number(length)) => length
+            .as_u64()
+            .map(|length| Some(length as usize))
+            .ok_or(EnvelopeError),
+        Some(_) => Err(EnvelopeError),
+    }
+}
+
+/// Extracts the `environment` field from a JSON item body.
+fn environment_of_json(body: &[u8]) -> Option<String> {
+    let value = parse_json(body)?;
+    value
+        .get("environment")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds an envelope wire payload from header/item lines, filling the
+    /// `length` field of `{LEN}` placeholders with the real body size.
+    fn envelope(header: &str, items: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut payload = format!("{header}\n").into_bytes();
+        for (index, (item_header, body)) in items.iter().enumerate() {
+            let item_header = item_header.replace("{LEN}", &body.len().to_string());
+            payload.extend_from_slice(item_header.as_bytes());
+            payload.push(b'\n');
+            payload.extend_from_slice(body);
+            if index + 1 < items.len() {
+                payload.push(b'\n');
+            }
+        }
+        payload
+    }
+
+    fn multi_item_envelope() -> Vec<u8> {
+        envelope(
+            "{\"event_id\":\"84df5a5f-51d8-409a-9416-a1adb4b0e3d0\",\"sent_at\":\"2024-01-01T00:00:00Z\"}",
+            &[
+                (
+                    "{\"type\":\"event\",\"length\":{LEN}}",
+                    br#"{"environment":"production","message":"boom","timestamp":"2024-01-01T00:00:00Z"}"#,
+                ),
+                (
+                    "{\"type\":\"transaction\"}",
+                    br#"{"environment":"staging","trace_id":"abc"}"#,
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn parses_multi_item_envelope_with_categories_and_environment() {
+        let payload = Payload::parse_envelope(&multi_item_envelope());
+        let Payload::Envelope(envelope) = payload else {
+            panic!("expected an envelope payload");
+        };
+        assert_eq!(envelope.items().len(), 2);
+        assert_eq!(
+            envelope.event_id().as_deref(),
+            Some("84df5a5f-51d8-409a-9416-a1adb4b0e3d0")
+        );
+
+        let items = envelope.summaries();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].category, ItemCategory::Event);
+        assert_eq!(items[0].environment, "production");
+        assert_eq!(items[1].category, ItemCategory::Transaction);
+        assert_eq!(items[1].environment, "staging");
+    }
+
+    #[test]
+    fn attachment_without_length_consumes_the_rest() {
+        let payload = b"{\"event_id\":\"id-1\"}\n{\"type\":\"attachment\",\"length\":5}\n\x00\x01\x02\x03\x04\n{\"type\":\"event\",\"length\":2}\n{}";
+
+        let envelope = Payload::parse_envelope(payload);
+        let Payload::Envelope(envelope) = envelope else {
+            panic!("expected an envelope payload");
+        };
+
+        assert_eq!(envelope.items().len(), 2);
+        let items = envelope.summaries();
+        assert_eq!(items[0].category, ItemCategory::Other);
+        assert_eq!(items[0].environment, "unknown");
+        assert_eq!(items[1].environment, "unknown");
+    }
+
+    #[test]
+    fn unrecognized_bodies_fail_open() {
+        for body in [
+            &b"not json at all"[..],
+            b"{}\nnot json",
+            b"[]",
+            b"\"string\"",
+            b"{}",
+        ] {
+            assert_eq!(Payload::parse_envelope(body), Payload::Unrecognized);
+        }
+    }
+
+    #[test]
+    fn envelope_round_trips_through_serialize() {
+        let payload = Payload::parse_envelope(&multi_item_envelope());
+        let Payload::Envelope(envelope) = payload else {
+            panic!("expected an envelope payload");
+        };
+
+        let serialized = envelope.to_bytes();
+        let reparsed = Payload::parse_envelope(&serialized);
+        assert_eq!(
+            Payload::Envelope(Envelope::parse(&serialized).expect("reparse")),
+            reparsed
+        );
+    }
+
+    #[test]
+    fn store_json_is_a_single_event_item() {
+        let payload =
+            Payload::parse_store_event(br#"{"event_id":"42","environment":"production"}"#);
+        assert_eq!(
+            payload,
+            Payload::StoreEvent {
+                environment: "production".into()
+            }
+        );
+    }
+
+    #[test]
+    fn non_json_store_bodies_fail_open() {
+        assert_eq!(
+            Payload::parse_store_event(b"\x00\x01\x02"),
+            Payload::Unrecognized
+        );
+        assert_eq!(
+            Payload::parse_store_event(b"[1,2,3]"),
+            Payload::Unrecognized
+        );
+    }
+}

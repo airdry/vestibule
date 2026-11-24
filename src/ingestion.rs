@@ -78,11 +78,12 @@ pub fn lock_wal(wal: &Mutex<Wal>) -> std::sync::MutexGuard<'_, Wal> {
 }
 
 /// The outcome of handling an `Ingestion Route` request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestionOutcome {
-    /// The payload was durably appended to the `Ingestion Queue`.
-    Accepted,
-    /// The payload exceeded `ingest.max_compressed_body_bytes`.
+    /// The payload was durably appended to the `Ingestion Queue`; carries
+    /// the envelope header's `event_id` when one was parsed.
+    Accepted(Option<String>),
+    /// The payload exceeded a configured size limit.
     PayloadTooLarge,
 }
 
@@ -108,6 +109,11 @@ impl IngestionPipeline {
         self.settings.max_compressed_body_bytes
     }
 
+    /// Upper bound on the decompressed request body size.
+    pub fn max_decompressed_body_bytes(&self) -> u64 {
+        self.settings.max_decompressed_body_bytes
+    }
+
     /// Appends the payload to the `Ingestion Queue`.
     ///
     /// # Errors
@@ -117,6 +123,19 @@ impl IngestionPipeline {
         let mut wal = lock_wal(&self.wal);
         wal.append(route, auth, body)
     }
+}
+
+/// Extracts the numeric `project_id` from an `Ingestion Route` path.
+///
+/// `/api/store/` carries no project id so global defaults apply.
+pub fn project_id(path: &str) -> Option<u64> {
+    let segment = path
+        .strip_prefix("/api/")
+        .and_then(|rest| rest.split_once('/'))?
+        .0;
+    is_positive_numeric_project_id(segment)
+        .then(|| segment.parse().ok())
+        .flatten()
 }
 
 #[cfg(test)]
@@ -144,6 +163,20 @@ mod tests {
         assert!(!is_ingestion_route("/api/"));
         assert!(!is_ingestion_route("/api/store"));
         assert!(!is_ingestion_route("/api/store/extra"));
+    }
+
+    #[test]
+    fn extracts_project_id_from_ingestion_routes() {
+        assert_eq!(project_id("/api/42/envelope/"), Some(42));
+        assert_eq!(project_id("/api/7/store/"), Some(7));
+        assert_eq!(project_id("/api/123/minidump/"), Some(123));
+        assert_eq!(
+            project_id("/api/store/"),
+            None,
+            "global store has no project id"
+        );
+        assert_eq!(project_id("/api/07/envelope/"), None);
+        assert_eq!(project_id("/_static/app.css"), None);
     }
 
     #[test]

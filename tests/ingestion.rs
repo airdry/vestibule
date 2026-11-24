@@ -115,6 +115,148 @@ fn legacy_store_route_is_ingested() {
     assert!(upstream.recorded_requests().is_empty());
 }
 
+/// Gzip-compresses a request body for the compressed-payload tests.
+fn gzip_compress(data: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("gzip body");
+    encoder.finish().expect("finish gzip")
+}
+
+/// Builds a multi-item envelope wire payload, filling item `length` fields
+/// with the real body sizes.
+fn envelope_bytes(header: &str, items: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut payload = format!("{header}\n").into_bytes();
+    for (index, (item_header, body)) in items.iter().enumerate() {
+        let item_header = item_header.replace("{LEN}", &body.len().to_string());
+        payload.extend_from_slice(item_header.as_bytes());
+        payload.push(b'\n');
+        payload.extend_from_slice(body);
+        if index + 1 < items.len() {
+            payload.push(b'\n');
+        }
+    }
+    payload
+}
+
+fn multi_item_envelope() -> Vec<u8> {
+    envelope_bytes(
+        "{\"event_id\":\"84df5a5f-51d8-409a-9416-a1adb4b0e3d0\"}",
+        &[
+            (
+                "{\"type\":\"event\",\"length\":{LEN}}",
+                br#"{"environment":"production","message":"boom"}"#,
+            ),
+            (
+                "{\"type\":\"attachment\",\"length\":{LEN}}",
+                b"\x00\x01\x02\x03",
+            ),
+        ],
+    )
+}
+
+#[test]
+fn multi_item_envelope_reports_event_id_and_passes_through_upstream() {
+    let (app, upstream, _queue_dir) = start_with("");
+
+    let response = http_client()
+        .post(format!("{}/api/42/envelope/", app.data_plane_url))
+        .header("Content-Type", "application/x-sentry-envelope")
+        .body(multi_item_envelope())
+        .send()
+        .expect("POST envelope");
+
+    assert_eq!(response.status().as_u16(), 201);
+    assert_eq!(
+        response.text().expect("read response body"),
+        "{\"id\":\"84df5a5f-51d8-409a-9416-a1adb4b0e3d0\"}",
+        "accepted envelopes echo their header event_id"
+    );
+
+    support::wait_until(|| !upstream.recorded_requests().is_empty());
+    let forwarded = &upstream.recorded_requests()[0];
+    assert_eq!(forwarded.path, "/api/42/envelope/");
+    assert_eq!(forwarded.body, multi_item_envelope());
+}
+
+#[test]
+fn compressed_envelope_is_ingested_and_delivered_intact() {
+    let (app, upstream, _queue_dir) = start_with("");
+    let envelope = multi_item_envelope();
+    let compressed = gzip_compress(&envelope);
+
+    let response = http_client()
+        .post(format!("{}/api/42/envelope/", app.data_plane_url))
+        .header("Content-Encoding", "gzip")
+        .body(compressed.clone())
+        .send()
+        .expect("POST compressed envelope");
+
+    assert_eq!(response.status().as_u16(), 201);
+    assert_eq!(
+        response.text().expect("read response body"),
+        "{\"id\":\"84df5a5f-51d8-409a-9416-a1adb4b0e3d0\"}"
+    );
+
+    support::wait_until(|| !upstream.recorded_requests().is_empty());
+    let forwarded = &upstream.recorded_requests()[0];
+    assert_eq!(
+        forwarded.body, compressed,
+        "raw compressed bytes must be forwarded"
+    );
+    assert_eq!(forwarded.header("content-encoding"), Some("gzip"));
+}
+
+#[test]
+fn decompressed_body_over_the_limit_is_rejected_with_413() {
+    // A body that decompresses to 1 MB under a 16-byte limit.
+    let (app, upstream, queue_dir) = start_with("ingest:\n  max_decompressed_body_bytes: 16\n");
+    let compressed = gzip_compress(&[0; 1024 * 1024]);
+
+    let response = http_client()
+        .post(format!("{}/api/42/envelope/", app.data_plane_url))
+        .header("Content-Encoding", "gzip")
+        .body(compressed)
+        .send()
+        .expect("POST zip bomb");
+
+    assert_eq!(response.status().as_u16(), 413);
+    assert!(upstream.recorded_requests().is_empty());
+    let segments = std::fs::read_dir(&queue_dir)
+        .expect("read queue dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "log"))
+        .map(|entry| entry.metadata().expect("metadata").len())
+        .sum::<u64>();
+    assert_eq!(
+        segments, 0,
+        "oversized decompressed payloads must not be queued"
+    );
+}
+
+#[test]
+fn corrupt_compressed_body_fails_open_as_raw_bytes() {
+    let (app, upstream, _queue_dir) = start_with("");
+    let corrupted = {
+        let compressed = gzip_compress(b"{}");
+        compressed[..compressed.len() - 1].to_vec()
+    };
+
+    let response = http_client()
+        .post(format!("{}/api/42/envelope/", app.data_plane_url))
+        .header("Content-Encoding", "gzip")
+        .body(corrupted.clone())
+        .send()
+        .expect("POST corrupted body");
+
+    assert_eq!(response.status().as_u16(), 201);
+    support::wait_until(|| !upstream.recorded_requests().is_empty());
+    assert_eq!(upstream.recorded_requests()[0].body, corrupted);
+}
+
 #[test]
 fn ingestion_with_query_string_and_auth_is_accepted() {
     let (app, _upstream, _queue_dir) = start_with("");

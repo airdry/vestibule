@@ -4,7 +4,9 @@ use pingora::http::RequestHeader;
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 
+use crate::codec::Payload;
 use crate::config::UpstreamTarget;
+use crate::decompression::{DecompressError, DecompressedBody, decompress};
 use crate::ingestion::{self, ForwardedMetadata, IngestionOutcome, IngestionPipeline};
 
 /// Pingora proxy that forwards `Pass-Through Traffic` to the configured
@@ -37,8 +39,9 @@ impl ProxyHttp for DataPlaneProxy {
 
         let outcome = ingest(&self.ingestion, session).await?;
         match outcome {
-            IngestionOutcome::Accepted => {
-                acknowledge_ingestion(session, self.ingestion.success_status_code()).await?;
+            IngestionOutcome::Accepted(event_id) => {
+                acknowledge_ingestion(session, self.ingestion.success_status_code(), event_id)
+                    .await?;
             }
             IngestionOutcome::PayloadTooLarge => {
                 session.respond_error(413).await?;
@@ -70,8 +73,8 @@ impl ProxyHttp for DataPlaneProxy {
     }
 }
 
-/// Reads the ingestion request body (enforcing the compressed size limit)
-/// and appends it to the `Ingestion Queue`.
+/// Reads the ingestion request body, decompresses it for inspection,
+/// and appends the original bytes to the `Ingestion Queue`.
 async fn ingest(pipeline: &IngestionPipeline, session: &mut Session) -> Result<IngestionOutcome> {
     let (route, auth) = capture_request_metadata(session);
     let max_body_bytes = pipeline.max_compressed_body_bytes() as usize;
@@ -86,6 +89,16 @@ async fn ingest(pipeline: &IngestionPipeline, session: &mut Session) -> Result<I
     };
     session.as_downstream_mut().finish_body().await?;
 
+    let event_id = match inspect_body(
+        &route,
+        content_encoding(session),
+        &body,
+        pipeline.max_decompressed_body_bytes(),
+    ) {
+        Inspection::Accepted(event_id) => event_id,
+        Inspection::TooLarge => return Ok(IngestionOutcome::PayloadTooLarge),
+    };
+
     pipeline.accept(&route, &auth, &body).map_err(|error| {
         pingora::Error::because(
             InternalError,
@@ -93,7 +106,59 @@ async fn ingest(pipeline: &IngestionPipeline, session: &mut Session) -> Result<I
             error,
         )
     })?;
-    Ok(IngestionOutcome::Accepted)
+    Ok(IngestionOutcome::Accepted(event_id))
+}
+
+/// The result of decompressing and parsing an ingestion body.
+enum Inspection {
+    /// The body is acceptable; carries the envelope header `event_id`.
+    Accepted(Option<String>),
+    /// The decompressed body exceeded `ingest.max_decompressed_body_bytes`.
+    TooLarge,
+}
+
+/// Decompresses the body (failing open on unsupported or corrupt
+/// encodings) and extracts the envelope header `event_id` when present.
+fn inspect_body(
+    route: &str,
+    encoding: Option<&str>,
+    body: &[u8],
+    max_decompressed_body_bytes: u64,
+) -> Inspection {
+    let decompressed = match decompress(encoding.unwrap_or(""), body, max_decompressed_body_bytes) {
+        Ok(DecompressedBody::Bytes(decompressed)) => decompressed,
+        Ok(DecompressedBody::Passthrough) => body.to_vec(),
+        // Corrupted compressed streams and decompressed oversizes fail open:
+        // the raw bytes are preserved as-is.
+        Err(DecompressError::TooLarge) => return Inspection::TooLarge,
+        Err(DecompressError::Corrupt) => body.to_vec(),
+    };
+
+    let event_id = match parse_payload(route, &decompressed) {
+        Payload::Envelope(envelope) => envelope.event_id(),
+        Payload::StoreEvent { .. } | Payload::Unrecognized => None,
+    };
+    Inspection::Accepted(event_id)
+}
+
+/// Parses the body according to the `Ingestion Route` shape.
+fn parse_payload(route: &str, body: &[u8]) -> Payload {
+    if route.ends_with("/envelope/") {
+        Payload::parse_envelope(body)
+    } else if route.ends_with("/store/") {
+        Payload::parse_store_event(body)
+    } else {
+        Payload::Unrecognized
+    }
+}
+
+/// The `Content-Encoding` header value, if any.
+fn content_encoding(session: &Session) -> Option<&str> {
+    session
+        .req_header()
+        .headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
 }
 
 /// Captures the route and forwarded metadata before the body is consumed.
@@ -151,8 +216,16 @@ async fn read_limited_body(
 }
 
 /// Immediately acknowledges the SDK with the configured success status and
-/// an empty JSON body.
-async fn acknowledge_ingestion(session: &mut Session, status: u16) -> Result<()> {
+/// an empty or `event_id`-bearing JSON body.
+async fn acknowledge_ingestion(
+    session: &mut Session,
+    status: u16,
+    event_id: Option<String>,
+) -> Result<()> {
+    let body = match event_id {
+        Some(event_id) => format!("{{\"id\":\"{event_id}\"}}"),
+        None => "{}".to_string(),
+    };
     let mut response = ResponseHeader::build(status, Some(2))
         .or_err(InternalError, "failed to build the ingestion response")?;
     response
@@ -162,7 +235,7 @@ async fn acknowledge_ingestion(session: &mut Session, status: u16) -> Result<()>
         .write_response_header(Box::new(response), false)
         .await?;
     session
-        .write_response_body(Some(Bytes::from_static(b"{}")), true)
+        .write_response_body(Some(Bytes::from(body)), true)
         .await
 }
 
