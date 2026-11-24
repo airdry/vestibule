@@ -313,11 +313,14 @@ impl ServiceProcess {
     /// both planes accept connections.
     pub fn start(config_path: &std::path::Path) -> Self {
         let binary = env!("CARGO_BIN_EXE_sentry-ratelimiter");
+        // Keep service logs for post-mortem debugging of crash tests.
+        let stderr_path = std::env::temp_dir().join("sentry-ratelimiter-service-stderr.log");
+        let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr log");
         let child = std::process::Command::new(binary)
             .arg("--config")
             .arg(config_path)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(stderr_file))
             .spawn()
             .expect("spawn service process");
 

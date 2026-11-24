@@ -39,3 +39,16 @@ _Avoid_: failover queue, buffer, spool
 **Upstream Health**:
 The tracked availability state of Upstream (`Healthy` or `Unhealthy`), driven by active health probes and passive delivery failures, controlling whether queued telemetry is forwarded or held.
 _Avoid_: circuit state, nginx status, backend health
+
+**Checkpoint**:
+
+The durable consumer position of the Ingestion Queue: every record before it is durably handled. Advanced only through monotonic, idempotent commits of contiguous delivery prefixes.
+_Avoid_: cursor, offset, read position
+
+**Claim**:
+An in-memory lease of one queued record by the delivery dispatcher; claims advance a volatile scan cursor and are replayed (at-least-once) after a restart until a Checkpoint commits them.
+_Avoid_: lock, lease, read
+
+**Merge Group**:
+A set of queued `/envelope/` records sharing one `(route, credentials)` key, eligible for merging into a single gzip-compressed Envelope on egress.
+_Avoid_: batch key, group key
