@@ -162,8 +162,9 @@ impl UpstreamHealthTracker {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Hysteresis::default();
         let _ = self.healthy.send(healthy);
-        eprintln!(
-            "health: Upstream Health transitioned to {}",
+        crate::log_info!(
+            "health",
+            "Upstream Health transitioned to {}",
             if healthy { "Healthy" } else { "Unhealthy" }
         );
     }
@@ -219,7 +220,7 @@ impl HealthProber {
                 .expected_statuses
                 .contains(&response.status().as_u16()),
             Err(error) => {
-                eprintln!("health: probe request failed: {error}");
+                crate::log_debug!("health", "probe request failed: {error}");
                 false
             }
         };

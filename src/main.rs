@@ -18,7 +18,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(never) => match never {},
         Err(error) => {
-            eprintln!("error: {error:#}");
+            sentry_ratelimiter::log_error!("startup", "{error:#}");
             ExitCode::FAILURE
         }
     }

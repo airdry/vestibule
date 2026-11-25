@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::codec::{ItemCategory, Payload};
 use crate::config::{RateLimitSettings, SharedSettings};
+use crate::metrics::{Metrics, normalize_environment};
 use crate::rate_limit::{self, CheckItem, Decision, RateLimiter};
 use crate::wal::{Wal, WalError};
 
@@ -155,6 +156,18 @@ pub enum RateLimitDecision {
     },
 }
 
+/// The rate-limit outcome of one envelope or store Item, as evaluated
+/// against its `Rate Limit Rule`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedItem {
+    pub category: ItemCategory,
+    /// The raw item `environment` (the codec's `"unknown"` placeholder
+    /// included), before allowlist normalization.
+    pub environment: String,
+    /// `true` when the item passed its rule.
+    pub allowed: bool,
+}
+
 /// Accepts `Ingestion Route` payloads into the durable `Ingestion Queue`.
 ///
 /// Both the ingest settings and the `Rate Limit Rules` are read from the
@@ -164,6 +177,7 @@ pub struct IngestionPipeline {
     wal: Arc<Mutex<Wal>>,
     rate_limiter: Arc<RateLimiter>,
     settings: SharedSettings,
+    metrics: Arc<Metrics>,
 }
 
 impl IngestionPipeline {
@@ -171,11 +185,13 @@ impl IngestionPipeline {
         wal: Arc<Mutex<Wal>>,
         rate_limiter: Arc<RateLimiter>,
         settings: SharedSettings,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             wal,
             rate_limiter,
             settings,
+            metrics,
         }
     }
 
@@ -205,14 +221,35 @@ impl IngestionPipeline {
         wal.append(route, auth, body)
     }
 
-    /// Evaluates every item of the payload against its `Rate Limit Rule`.
+    /// Evaluates every item of the payload against its `Rate Limit Rule`,
+    /// recording each outcome as an `ingest_items_total` sample.
     ///
     /// `Payload::Unrecognized` fails open (no rate limiting). For partially
     /// denied envelopes the decision carries the rebuilt envelope bytes with
     /// only the allowed items.
     pub fn evaluate(&self, route: &str, payload: &Payload) -> RateLimitDecision {
-        let settings = self.settings.load();
-        evaluate(&self.rate_limiter, &settings.rate_limits, route, payload)
+        let snapshot = self.settings.load();
+        let (decision, items) =
+            evaluate_detailed(&self.rate_limiter, &snapshot.rate_limits, route, payload);
+        let project = project_id(route)
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        for item in items {
+            self.metrics.record_ingest_item(
+                &project,
+                normalize_environment(
+                    &snapshot.observability.environment_label_allowlist,
+                    &item.environment,
+                ),
+                item.category.as_str(),
+                if item.allowed {
+                    "accepted"
+                } else {
+                    "throttled"
+                },
+            );
+        }
+        decision
     }
 }
 
@@ -223,12 +260,24 @@ pub fn evaluate(
     route: &str,
     payload: &Payload,
 ) -> RateLimitDecision {
+    evaluate_detailed(rate_limiter, settings, route, payload).0
+}
+
+/// Evaluates every item of the payload against its `Rate Limit Rule`,
+/// also returning the per-item outcomes for `ingest_items_total`.
+pub fn evaluate_detailed(
+    rate_limiter: &RateLimiter,
+    settings: &RateLimitSettings,
+    route: &str,
+    payload: &Payload,
+) -> (RateLimitDecision, Vec<CheckedItem>) {
     let project = project_id(route);
     let mut denials = Denials::default();
+    let mut items: Vec<CheckedItem> = Vec::new();
     let keep = match payload {
-        Payload::Unrecognized => return RateLimitDecision::Allowed,
+        Payload::Unrecognized => return (RateLimitDecision::Allowed, items),
         Payload::StoreEvent { environment } => {
-            check_item(
+            let allowed = check_item(
                 rate_limiter,
                 settings,
                 project,
@@ -236,25 +285,36 @@ pub fn evaluate(
                 ItemCategory::Event,
                 &mut denials,
             );
+            items.push(CheckedItem {
+                category: ItemCategory::Event,
+                environment: environment.clone(),
+                allowed,
+            });
             Vec::new()
         }
         Payload::Envelope(envelope) => envelope
             .summaries()
             .into_iter()
             .map(|summary| {
-                check_item(
+                let allowed = check_item(
                     rate_limiter,
                     settings,
                     project,
                     &summary.environment,
                     summary.category,
                     &mut denials,
-                )
+                );
+                items.push(CheckedItem {
+                    category: summary.category,
+                    environment: summary.environment,
+                    allowed,
+                });
+                allowed
             })
             .collect::<Vec<bool>>(),
     };
     if denials.entries.is_empty() {
-        return RateLimitDecision::Allowed;
+        return (RateLimitDecision::Allowed, items);
     }
     let rate_limits = denials.header_value();
     let kept_envelope = match payload {
@@ -263,7 +323,7 @@ pub fn evaluate(
         }
         _ => None,
     };
-    match kept_envelope {
+    let decision = match kept_envelope {
         Some(envelope) => RateLimitDecision::PartiallyDenied {
             body: envelope.to_bytes(),
             rate_limits,
@@ -272,7 +332,8 @@ pub fn evaluate(
             rate_limits,
             retry_after: denials.max_retry_after,
         },
-    }
+    };
+    (decision, items)
 }
 
 /// Checks one item against its resolved `Rate Limit Rule`, recording it in

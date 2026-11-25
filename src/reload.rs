@@ -102,8 +102,9 @@ impl ReloadManager {
             }
             Err(error) => {
                 let error = error.to_string();
-                eprintln!(
-                    "reload: rejected invalid configuration from {}: {error}",
+                crate::log_warn!(
+                    "reload",
+                    "rejected invalid configuration from {}: {error}",
                     self.path.display()
                 );
                 let mut state = self
@@ -120,19 +121,22 @@ impl ReloadManager {
     /// effect without a restart.
     fn warn_startup_only_changes(&self, config: &Config) {
         if config.server.data_plane_addr != self.startup.data_plane_addr {
-            eprintln!(
-                "reload: server.data_plane_addr is startup-only and was not applied \
-                 (restart required)"
+            crate::log_warn!(
+                "reload",
+                "server.data_plane_addr is startup-only and was not applied (restart required)"
             );
         }
         if config.server.admin_addr != self.startup.admin_addr {
-            eprintln!(
-                "reload: server.admin_addr is startup-only and was not applied \
-                 (restart required)"
+            crate::log_warn!(
+                "reload",
+                "server.admin_addr is startup-only and was not applied (restart required)"
             );
         }
         if config.queue.dir != self.startup.queue_dir {
-            eprintln!("reload: queue.dir is startup-only and was not applied (restart required)");
+            crate::log_warn!(
+                "reload",
+                "queue.dir is startup-only and was not applied (restart required)"
+            );
         }
     }
 }
@@ -164,7 +168,7 @@ impl ConfigWatcher {
         let _watcher = match watch_directory(&self.manager.path, events_tx) {
             Ok(watcher) => watcher,
             Err(error) => {
-                eprintln!("reload: failed to watch the config directory: {error}");
+                crate::log_error!("reload", "failed to watch the config directory: {error}");
                 return;
             }
         };
@@ -239,7 +243,7 @@ impl BackgroundService for SighupReloader {
         {
             Ok(sighup) => sighup,
             Err(error) => {
-                eprintln!("reload: failed to listen for SIGHUP: {error}");
+                crate::log_error!("reload", "failed to listen for SIGHUP: {error}");
                 return;
             }
         };

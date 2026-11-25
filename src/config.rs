@@ -55,9 +55,12 @@ impl LogLevel {
 }
 
 /// Observability settings applied to logging and metrics (hot-reloadable).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ObservabilitySettings {
     pub log_level: LogLevel,
+    /// Environments kept as their own `environment` metric label; every
+    /// unlisted value maps to `"other"` to bound Prometheus cardinality.
+    pub environment_label_allowlist: Vec<String>,
 }
 
 /// Errors surfaced when loading or validating the startup configuration.
@@ -383,7 +386,7 @@ impl Config {
             batch: self.batch.clone(),
             rate_limits: self.rate_limits.clone(),
             healthcheck: self.upstream.healthcheck.clone(),
-            observability: self.observability,
+            observability: self.observability.clone(),
         }
     }
 
@@ -634,7 +637,24 @@ impl Config {
             .transpose()
             .map_err(|message| Self::invalid(path, format!("observability.log_level: {message}")))?
             .unwrap_or(LogLevel::Info);
-        Ok(ObservabilitySettings { log_level })
+        let environment_label_allowlist = raw.environment_label_allowlist.unwrap_or_else(|| {
+            ["stage", "preprod", "prod", "production"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        });
+        if environment_label_allowlist.is_empty() {
+            return Err(Self::invalid(
+                path,
+                "observability.environment_label_allowlist must not be empty \
+                 (every environment would map to other)"
+                    .to_string(),
+            ));
+        }
+        Ok(ObservabilitySettings {
+            log_level,
+            environment_label_allowlist,
+        })
     }
 
     fn missing_section(path: &str, section: &str, expected_keys: &str) -> ConfigError {
@@ -1228,6 +1248,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_environment_label_allowlist_with_default() {
+        let default_config = Config::from_str(&base_yaml(), "<test config>").unwrap();
+        assert_eq!(
+            default_config.observability.environment_label_allowlist,
+            ["stage", "preprod", "prod", "production"]
+        );
+
+        let yaml = format!(
+            "{}observability:\n\x20 log_level: debug\n\x20 environment_label_allowlist: [dev, prod]\n",
+            base_yaml()
+        );
+        let config = Config::from_str(&yaml, "<test config>").unwrap();
+        assert_eq!(
+            config.observability.environment_label_allowlist,
+            ["dev", "prod"]
+        );
+    }
+
+    #[test]
+    fn rejects_empty_environment_label_allowlist() {
+        let yaml = format!(
+            "{}observability:\n\x20 environment_label_allowlist: []\n",
+            base_yaml()
+        );
+        let error = Config::from_str(&yaml, "<test config>").unwrap_err();
+        assert!(
+            error.to_string().contains("environment_label_allowlist"),
+            "an empty allowlist would map every environment to other: {error}"
+        );
+    }
+
+    #[test]
     fn extracts_hot_reloadable_runtime_settings() {
         let yaml = format!(
             "{}\
@@ -1382,6 +1434,7 @@ struct RawQueue {
 #[serde(deny_unknown_fields)]
 struct RawObservability {
     log_level: Option<String>,
+    environment_label_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

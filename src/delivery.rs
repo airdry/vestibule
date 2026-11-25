@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use flate2::write::GzEncoder;
@@ -28,6 +28,7 @@ use crate::codec::{Envelope, Payload};
 use crate::config::{SharedSettings, UpstreamTarget};
 use crate::health::UpstreamHealthTracker;
 use crate::ingestion::{ForwardedMetadata, lock_wal};
+use crate::metrics::Metrics;
 use crate::wal::{PendingRecord, Position, Wal};
 
 /// Tuning knobs of the delivery retry strategy.
@@ -76,6 +77,7 @@ pub struct DeliveryPool {
     policy: RetryPolicy,
     settings: SharedSettings,
     health: Arc<UpstreamHealthTracker>,
+    metrics: Arc<Metrics>,
 }
 
 impl DeliveryPool {
@@ -91,6 +93,7 @@ impl DeliveryPool {
         policy: RetryPolicy,
         settings: SharedSettings,
         health: Arc<UpstreamHealthTracker>,
+        metrics: Arc<Metrics>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(upstream.timeout)
@@ -103,6 +106,7 @@ impl DeliveryPool {
             policy,
             settings,
             health,
+            metrics,
         })
     }
 
@@ -121,6 +125,7 @@ impl DeliveryPool {
             target: self.upstream.clone(),
             policy: self.policy.clone(),
             health: Arc::clone(&self.health),
+            metrics: Arc::clone(&self.metrics),
         });
         let mut spawned_workers = 0;
 
@@ -260,7 +265,7 @@ impl Dispatcher {
                 Ok(Some(pending)) => pending,
                 Ok(None) => return,
                 Err(error) => {
-                    eprintln!("delivery: failed to read the ingestion queue: {error}");
+                    crate::log_error!("delivery", "failed to read the ingestion queue: {error}");
                     return;
                 }
             };
@@ -329,7 +334,7 @@ impl Dispatcher {
 
     fn send(&self, job: Job) {
         if let Err(error) = self.jobs_tx.try_send(job) {
-            eprintln!("delivery: failed to enqueue a batch: {error}");
+            crate::log_error!("delivery", "failed to enqueue a batch: {error}");
         }
     }
 
@@ -339,7 +344,7 @@ impl Dispatcher {
                 if let Some(position) = self.ledger.apply(&ids)
                     && let Err(error) = lock_wal(&self.wal).commit(position)
                 {
-                    eprintln!("delivery: failed to commit the queue checkpoint: {error}");
+                    crate::log_error!("delivery", "failed to commit the queue checkpoint: {error}");
                 }
             }
         }
@@ -473,6 +478,7 @@ struct WorkerContext {
     target: UpstreamTarget,
     policy: RetryPolicy,
     health: Arc<UpstreamHealthTracker>,
+    metrics: Arc<Metrics>,
 }
 
 async fn run_worker(
@@ -495,8 +501,10 @@ async fn run_worker(
                 &context.client,
                 &context.target,
                 &job.request,
+                job.ids.len(),
                 &context.policy,
                 &context.health,
+                &context.metrics,
             )
             .await
             {
@@ -522,16 +530,21 @@ async fn run_worker(
     }
 }
 
-/// Performs one delivery attempt, classifies the outcome, and reports
-/// passive failures (transport errors, timeouts, `502`/`503`/`504`) to
-/// the health tracker.
+/// Performs one delivery attempt, classifies the outcome, records the
+/// outbound RED metrics (`upstream_requests_total`,
+/// `upstream_request_duration_seconds`, `upstream_batch_items`), and
+/// reports passive failures (transport errors, timeouts, `502`/`503`/
+/// `504`) to the health tracker.
 async fn send(
     client: &reqwest::Client,
     target: &UpstreamTarget,
     request: &OutboundRequest,
+    items: usize,
     policy: &RetryPolicy,
     health: &UpstreamHealthTracker,
+    metrics: &Metrics,
 ) -> Decision {
+    let start = Instant::now();
     let url = format!(
         "{}://{}{}{}",
         if target.tls { "https" } else { "http" },
@@ -550,8 +563,9 @@ async fn send(
     let response = match http.body(request.body.clone()).send().await {
         Ok(response) => response,
         Err(error) => {
-            eprintln!("delivery: request to Upstream failed: {error}");
+            crate::log_warn!("delivery", "request to Upstream failed: {error}");
             health.report_passive_failure();
+            metrics.record_upstream_attempt("error", start.elapsed());
             return Decision::Retry;
         }
     };
@@ -562,12 +576,24 @@ async fn send(
         .headers()
         .get("retry-after")
         .and_then(|value| value.to_str().ok());
-    classify_response(
-        response.status(),
+    let status = response.status();
+    let outcome = match status.as_u16() {
+        200..=299 => "success",
+        429 => "throttled",
+        400..=499 => "dropped",
+        _ => "error",
+    };
+    let decision = classify_response(
+        status,
         retry_after,
         policy.initial_backoff,
         policy.retry_after_cap,
-    )
+    );
+    metrics.record_upstream_attempt(outcome, start.elapsed());
+    if matches!(decision, Decision::Commit) {
+        metrics.record_upstream_batch(outcome, items);
+    }
+    decision
 }
 
 /// Contiguous-prefix completion ledger: records complete out of order, but
@@ -674,7 +700,10 @@ fn classify_response(
             Decision::Throttle(pause)
         }
         400..=499 => {
-            eprintln!("delivery: dropping record after unrecoverable {status} response");
+            crate::log_warn!(
+                "delivery",
+                "dropping record after unrecoverable {status} response"
+            );
             Decision::Commit
         }
         _ => Decision::Retry,

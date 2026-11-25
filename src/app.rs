@@ -21,6 +21,8 @@ use crate::data_plane::DataPlaneProxy;
 use crate::delivery::{DeliveryPool, RetryPolicy};
 use crate::health::{HealthProber, UpstreamHealthTracker};
 use crate::ingestion::{IngestionPipeline, lock_wal};
+use crate::logging;
+use crate::metrics::Metrics;
 use crate::rate_limit::RateLimiter;
 use crate::reload::{ConfigWatcher, ReloadManager, SighupReloader};
 use crate::shutdown::{ShutdownFlag, WalFlusher};
@@ -69,6 +71,8 @@ pub fn run(config: Config, config_path: PathBuf) -> Result<Infallible, AppError>
     // The shared hot-reloadable settings snapshot, swapped by the reload
     // manager and read by every hot-path consumer.
     let shared = shared_settings(&config);
+    logging::init(Arc::clone(&shared));
+    let metrics = Arc::new(Metrics::new());
     let manager = Arc::new(ReloadManager::new(
         config_path,
         &config,
@@ -80,13 +84,19 @@ pub fn run(config: Config, config_path: PathBuf) -> Result<Infallible, AppError>
         Arc::clone(&wal),
         Arc::clone(&rate_limiter),
         Arc::clone(&shared),
+        Arc::clone(&metrics),
     );
 
     let health_tracker = Arc::new(UpstreamHealthTracker::new(Arc::clone(&shared)));
 
     let mut data_plane = http_proxy_service_with_name(
         &server.configuration,
-        DataPlaneProxy::new(config.upstream.clone(), ingestion),
+        DataPlaneProxy::new(
+            config.upstream.clone(),
+            ingestion,
+            Arc::clone(&metrics),
+            Arc::clone(&shared),
+        ),
         "Data Plane",
     );
     data_plane.add_tcp(&config.server.data_plane_addr.to_string());
@@ -96,6 +106,7 @@ pub fn run(config: Config, config_path: PathBuf) -> Result<Infallible, AppError>
         Arc::clone(&wal),
         &config,
         Arc::clone(&manager),
+        Arc::clone(&metrics),
     ));
     let mut admin_plane = http_proxy_service_with_name(
         &server.configuration,
@@ -118,6 +129,7 @@ pub fn run(config: Config, config_path: PathBuf) -> Result<Infallible, AppError>
         RetryPolicy::default(),
         Arc::clone(&shared),
         health_tracker,
+        Arc::clone(&metrics),
     )
     .map_err(|message| AppError::ServerInit { message })?;
     server.add_service(background_service("Delivery Worker", delivery_worker));
@@ -173,7 +185,7 @@ impl pingora::services::background::BackgroundService for FsyncWorker {
                 _ = tokio::time::sleep(self.interval) => {}
             }
             if let Err(error) = lock_wal(&self.wal).sync() {
-                eprintln!("fsync worker: failed to sync the ingestion queue: {error}");
+                crate::log_error!("fsync", "failed to sync the ingestion queue: {error}");
             }
         }
     }

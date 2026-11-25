@@ -118,8 +118,19 @@ pub struct QueueUtilization {
     pub pending_bytes: u64,
     /// Number of segment files currently on disk.
     pub segments: u64,
+    /// Number of records not yet committed past the checkpoint.
+    pub pending_items: u64,
     /// Age of the oldest pending record; `None` when fully drained.
     pub oldest_entry_age: Option<Duration>,
+}
+
+/// Cumulative record drops from the `Ingestion Queue`, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueueDrops {
+    /// Records skipped after exceeding the `queue.max_age` TTL.
+    pub expired: u64,
+    /// Records deleted by `queue.max_bytes` overflow eviction.
+    pub evicted: u64,
 }
 
 /// The durable `Ingestion Queue` stored in `queue.dir`.
@@ -139,6 +150,8 @@ pub struct Wal {
     /// In-memory scan cursor pointing at the next record to claim; may
     /// run ahead of `checkpoint` while claimed records are in flight.
     scan_pos: Position,
+    /// Cumulative drops, surfaced as `queue_dropped_total{reason}`.
+    dropped: QueueDrops,
 }
 
 impl Wal {
@@ -185,6 +198,7 @@ impl Wal {
             total_size: total_segment_bytes(dir)?,
             checkpoint,
             scan_pos,
+            dropped: QueueDrops::default(),
         };
         wal.persist_checkpoint()?;
         Ok(wal)
@@ -252,6 +266,7 @@ impl Wal {
                         // Expired records are skipped in-memory only: the
                         // durable checkpoint does not move until the record
                         // would also be re-skipped after a crash.
+                        self.dropped.expired += 1;
                         self.scan_pos = Position {
                             segment_id,
                             offset: frame_end,
@@ -316,6 +331,12 @@ impl Wal {
         self.max_age = max_age;
     }
 
+    /// Cumulative record drops, by reason (rendered as
+    /// `queue_dropped_total{reason}` on `/metrics`).
+    pub fn drops(&self) -> QueueDrops {
+        self.dropped
+    }
+
     /// Reports the queue utilization for `GET /status`: on-disk bytes of
     /// records still pending beyond the checkpoint, the number of segment
     /// files, and the age of the oldest pending record.
@@ -326,6 +347,7 @@ impl Wal {
     pub fn utilization(&self) -> Result<QueueUtilization, WalError> {
         let segment_ids = list_segment_ids(&self.dir)?;
         let mut pending_bytes = 0;
+        let mut pending_items = 0;
         let mut oldest: Option<u64> = None;
         let now = self.clock.now_unix_ms();
         for &segment_id in segment_ids
@@ -339,11 +361,14 @@ impl Wal {
                 0
             };
             while let Some(frame) = read_frame_at(&mut file, offset)
-                .inspect_err(|error| eprintln!("wal: skipping unreadable frame: {error:?}"))
+                .inspect_err(|error| {
+                    crate::log_warn!("wal", "skipping unreadable frame: {error:?}")
+                })
                 .ok()
                 .flatten()
             {
                 pending_bytes += frame.len as u64;
+                pending_items += 1;
                 oldest = Some(oldest.map_or(frame.record.enqueued_at_unix_ms, |oldest| {
                     oldest.min(frame.record.enqueued_at_unix_ms)
                 }));
@@ -353,6 +378,7 @@ impl Wal {
         Ok(QueueUtilization {
             pending_bytes,
             segments: segment_ids.len() as u64,
+            pending_items,
             oldest_entry_age: oldest.map(|at| Duration::from_millis(now.saturating_sub(at))),
         })
     }
@@ -376,6 +402,7 @@ impl Wal {
             };
 
             let size = file_size(&segment_path(&self.dir, oldest))?;
+            self.dropped.evicted += count_segment_records(&self.dir, oldest)?;
             fs::remove_file(segment_path(&self.dir, oldest))
                 .map_err(|source| WalError::io("evict overflowed segment", source))?;
             self.total_size -= size;
@@ -406,6 +433,19 @@ impl Wal {
 
 fn segment_path(dir: &Path, segment_id: u64) -> PathBuf {
     dir.join(format!("{SEGMENT_PREFIX}{segment_id:020}{SEGMENT_SUFFIX}"))
+}
+
+/// Counts the records stored in one segment file (for overflow-eviction
+/// drop accounting).
+fn count_segment_records(dir: &Path, segment_id: u64) -> Result<u64, WalError> {
+    let mut file = open_segment_file(dir, segment_id)?;
+    let mut records = 0;
+    let mut offset = 0;
+    while let Some(frame) = read_frame_at(&mut file, offset).ok().flatten() {
+        records += 1;
+        offset += frame.len as u64;
+    }
+    Ok(records)
 }
 
 fn open_segment_file(dir: &Path, segment_id: u64) -> Result<File, WalError> {

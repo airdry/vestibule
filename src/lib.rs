@@ -13,6 +13,8 @@ pub mod decompression;
 pub mod delivery;
 pub mod health;
 pub mod ingestion;
+pub mod logging;
+pub mod metrics;
 pub mod rate_limit;
 pub mod reload;
 pub mod shutdown;

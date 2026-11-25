@@ -53,7 +53,10 @@ impl BackgroundService for ReadinessDrainer {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         if shutdown.changed().await.is_ok() {
             self.flag.0.store(true, Ordering::Release);
-            eprintln!("shutdown: readiness flipped to draining (/readyz answers 503)");
+            crate::log_info!(
+                "shutdown",
+                "readiness flipped to draining (/readyz answers 503)"
+            );
         }
     }
 }
@@ -77,7 +80,7 @@ impl BackgroundService for WalFlusher {
         if shutdown.changed().await.is_ok()
             && let Err(error) = lock_wal(&self.wal).sync()
         {
-            eprintln!("shutdown: failed to sync the ingestion queue: {error}");
+            crate::log_error!("shutdown", "failed to sync the ingestion queue: {error}");
         }
     }
 }

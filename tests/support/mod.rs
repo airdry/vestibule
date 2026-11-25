@@ -483,6 +483,93 @@ pub fn http_client() -> reqwest::blocking::Client {
         .expect("build test http client")
 }
 
+/// One sample parsed from Prometheus text exposition.
+#[derive(Debug, Clone)]
+pub struct MetricSample {
+    pub name: String,
+    pub labels: std::collections::HashMap<String, String>,
+    pub value: f64,
+}
+
+/// Parses Prometheus text exposition into samples, skipping `#` comment
+/// lines. Label values are unescaped.
+pub fn parse_metrics(body: &str) -> Vec<MetricSample> {
+    let mut samples = Vec::new();
+    for line in body.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((metric, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let (name, labels) = match metric.strip_suffix('}') {
+            Some(name_without_braces) if metric.contains('{') => {
+                let name = name_without_braces
+                    .split('{')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let label_source = metric
+                    .split_once('{')
+                    .and_then(|(_, labels)| labels.strip_suffix('}'))
+                    .unwrap_or_default();
+                let labels = label_source
+                    .split(",")
+                    .filter_map(|pair| {
+                        let (label, value) = pair.split_once("=")?;
+                        Some((
+                            label.to_string(),
+                            value
+                                .trim_matches('"')
+                                .replace("\\\\", "\\")
+                                .replace("\\\"", "\"")
+                                .replace("\\n", "\n"),
+                        ))
+                    })
+                    .collect();
+                (name, labels)
+            }
+            _ => (metric.to_string(), Default::default()),
+        };
+        samples.push(MetricSample {
+            name,
+            labels,
+            value: value.parse().unwrap_or_default(),
+        });
+    }
+    samples
+}
+
+/// The value of the sample with exactly the given labels, if present.
+pub fn metric_value(samples: &[MetricSample], name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+    let wanted: std::collections::HashMap<_, _> = labels
+        .iter()
+        .map(|(label, value)| (label.to_string(), value.to_string()))
+        .collect();
+    samples
+        .iter()
+        .find(|sample| sample.name == name && sample.labels == wanted)
+        .map(|sample| sample.value)
+}
+
+/// Fetches and parses the Admin Plane `/metrics` exposition.
+pub fn scrape_metrics(app: &TestApp) -> Vec<MetricSample> {
+    let response = http_client()
+        .get(format!("{}/metrics", app.admin_url))
+        .send()
+        .expect("GET /metrics on the Admin Plane");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/plain")),
+        "the exposition must be served as text/plain"
+    );
+    parse_metrics(&response.text().expect("read the exposition body"))
+}
+
 /// Minimal YAML configuration for the given Upstream URL and ports.
 pub fn config_yaml(upstream_url: &str, data_plane_port: u16, admin_port: u16) -> String {
     config_yaml_with(upstream_url, data_plane_port, admin_port, "")
