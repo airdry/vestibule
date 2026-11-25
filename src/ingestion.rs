@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::codec::{ItemCategory, Payload};
-use crate::config::{IngestSettings, RateLimitSettings};
+use crate::config::{RateLimitSettings, SharedSettings};
 use crate::rate_limit::{self, CheckItem, Decision, RateLimiter};
 use crate::wal::{Wal, WalError};
 
@@ -156,42 +156,43 @@ pub enum RateLimitDecision {
 }
 
 /// Accepts `Ingestion Route` payloads into the durable `Ingestion Queue`.
+///
+/// Both the ingest settings and the `Rate Limit Rules` are read from the
+/// shared runtime settings snapshot on every request, so hot-reloads take
+/// effect immediately.
 pub struct IngestionPipeline {
     wal: Arc<Mutex<Wal>>,
-    settings: IngestSettings,
     rate_limiter: Arc<RateLimiter>,
-    rate_limits: Arc<RateLimitSettings>,
+    settings: SharedSettings,
 }
 
 impl IngestionPipeline {
     pub fn new(
         wal: Arc<Mutex<Wal>>,
-        settings: IngestSettings,
         rate_limiter: Arc<RateLimiter>,
-        rate_limits: Arc<RateLimitSettings>,
+        settings: SharedSettings,
     ) -> Self {
         Self {
             wal,
-            settings,
             rate_limiter,
-            rate_limits,
+            settings,
         }
     }
 
     /// The HTTP status used to immediately acknowledge accepted ingestion
     /// requests.
     pub fn success_status_code(&self) -> u16 {
-        self.settings.success_status_code
+        self.settings.load().ingest.success_status_code
     }
 
     /// Upper bound on the compressed request body size.
     pub fn max_compressed_body_bytes(&self) -> u64 {
-        self.settings.max_compressed_body_bytes
+        self.settings.load().ingest.max_compressed_body_bytes
     }
 
     /// Upper bound on the decompressed request body size.
     pub fn max_decompressed_body_bytes(&self) -> u64 {
-        self.settings.max_decompressed_body_bytes
+        self.settings.load().ingest.max_decompressed_body_bytes
     }
 
     /// Appends the payload to the `Ingestion Queue`.
@@ -210,7 +211,8 @@ impl IngestionPipeline {
     /// denied envelopes the decision carries the rebuilt envelope bytes with
     /// only the allowed items.
     pub fn evaluate(&self, route: &str, payload: &Payload) -> RateLimitDecision {
-        evaluate(&self.rate_limiter, &self.rate_limits, route, payload)
+        let settings = self.settings.load();
+        evaluate(&self.rate_limiter, &settings.rate_limits, route, payload)
     }
 }
 
@@ -365,7 +367,7 @@ pub fn project_id(path: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{RateLimitSettings, Rule, ScopeRules};
+    use crate::config::{Config, RateLimitSettings, Rule, ScopeRules};
     use crate::wal::Clock;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -527,7 +529,18 @@ mod tests {
     }
 
     fn limiter(clock: &Arc<MockClock>) -> RateLimiter {
-        RateLimiter::new(clock.clone(), 100, Duration::from_secs(600))
+        let yaml = "server:\n\
+                    \x20 data_plane_addr: \"127.0.0.1:18080\"\n\
+                    \x20 admin_addr: \"127.0.0.1:18081\"\n\
+                    upstream:\n\
+                    \x20 url: \"http://127.0.0.1:18082\"\n\
+                    rate_limits:\n\
+                    \x20 max_buckets: 100\n";
+        let config = Config::from_str(yaml, "<test config>").expect("parse test config");
+        RateLimiter::new(
+            Arc::clone(clock) as Arc<dyn Clock>,
+            crate::config::shared_settings(&config),
+        )
     }
 
     #[test]

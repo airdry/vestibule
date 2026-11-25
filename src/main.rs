@@ -27,7 +27,7 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<Infallible> {
     let config_path = resolve_config_path(std::env::args_os().skip(1))?;
     let config = load_config(&config_path)?;
-    app::run(config).map_err(anyhow::Error::from)
+    app::run(config, config_path).map_err(anyhow::Error::from)
 }
 
 /// Resolves the configuration path from `--config <path>` (or `-c <path>`),

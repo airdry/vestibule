@@ -310,6 +310,12 @@ impl Wal {
             .map_err(|source| WalError::io("fsync segment", source))
     }
 
+    /// Applies a new record TTL (hot-reloadable `queue.max_age`): records
+    /// older than `max_age` are skipped by [`next_record`](Self::next_record).
+    pub fn set_max_age(&mut self, max_age: Duration) {
+        self.max_age = max_age;
+    }
+
     /// Reports the queue utilization for `GET /status`: on-disk bytes of
     /// records still pending beyond the checkpoint, the number of segment
     /// files, and the age of the oldest pending record.

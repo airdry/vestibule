@@ -16,7 +16,7 @@ use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use tokio::sync::watch;
 
-use crate::config::{HealthcheckSettings, UpstreamTarget};
+use crate::config::{HealthcheckSettings, SharedSettings, UpstreamTarget};
 
 /// The tracked availability state of the `Upstream`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +42,12 @@ struct Hysteresis {
 /// Shared `Upstream Health` state, updated by active probes and passive
 /// delivery failures, observable synchronously (`is_healthy`) and
 /// asynchronously (`wait_healthy`).
+///
+/// The hysteresis thresholds are read from the shared runtime settings
+/// snapshot on every observation, so healthcheck reloads take effect
+/// immediately.
 pub struct UpstreamHealthTracker {
-    settings: HealthcheckSettings,
+    settings: SharedSettings,
     counters: Mutex<Hysteresis>,
     healthy: watch::Sender<bool>,
     /// Kept alive so the watch channel never closes: `Sender::send`
@@ -53,7 +57,7 @@ pub struct UpstreamHealthTracker {
 
 impl UpstreamHealthTracker {
     /// Builds a tracker that starts `Healthy`.
-    pub fn new(settings: HealthcheckSettings) -> Self {
+    pub fn new(settings: SharedSettings) -> Self {
         let (healthy, healthy_rx) = watch::channel(true);
         Self {
             settings,
@@ -121,6 +125,9 @@ impl UpstreamHealthTracker {
     /// Applies one observation to the hysteresis counters, flipping the
     /// state when a threshold is reached.
     fn report(&self, healthy_observation: bool) {
+        let snapshot = self.settings.load();
+        let unhealthy_threshold = snapshot.healthcheck.unhealthy_threshold;
+        let healthy_threshold = snapshot.healthcheck.healthy_threshold;
         let flip = {
             let mut counters = self
                 .counters
@@ -132,13 +139,11 @@ impl UpstreamHealthTracker {
                     None
                 } else {
                     counters.consecutive_successes += 1;
-                    (counters.consecutive_successes >= self.settings.healthy_threshold)
-                        .then_some(true)
+                    (counters.consecutive_successes >= healthy_threshold).then_some(true)
                 }
             } else if self.is_healthy() {
                 counters.consecutive_failures += 1;
-                (counters.consecutive_failures >= self.settings.unhealthy_threshold)
-                    .then_some(false)
+                (counters.consecutive_failures >= unhealthy_threshold).then_some(false)
             } else {
                 counters.consecutive_successes = 0;
                 None
@@ -166,39 +171,51 @@ impl UpstreamHealthTracker {
 
 /// Periodically GETs the `Upstream` healthcheck endpoint and feeds the
 /// results into an [`UpstreamHealthTracker`].
+///
+/// Probe settings (path, expected statuses, interval, timeout) are read
+/// from the shared runtime settings snapshot on every probe, so healthcheck
+/// reloads apply to the next probe.
 pub struct HealthProber {
     client: reqwest::Client,
     target: UpstreamTarget,
+    settings: SharedSettings,
     tracker: Arc<UpstreamHealthTracker>,
 }
 
 impl HealthProber {
-    /// Builds the prober with a client honoring the healthcheck timeout.
+    /// Builds the prober with a client for the `Upstream`.
     ///
     /// # Errors
     ///
     /// Returns a message when the HTTP client cannot be constructed.
     pub fn new(
         target: UpstreamTarget,
+        settings: SharedSettings,
         tracker: Arc<UpstreamHealthTracker>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
-            .timeout(target.healthcheck.timeout)
             .build()
             .map_err(|error| format!("failed to build the healthcheck client: {error}"))?;
         Ok(Self {
             client,
             target,
+            settings,
             tracker,
         })
     }
 
     /// Performs one probe and reports it to the tracker.
     async fn probe_once(&self) {
-        let healthy = match self.client.get(probe_url(&self.target)).send().await {
-            Ok(response) => self
-                .target
-                .healthcheck
+        let snapshot = self.settings.load();
+        let healthcheck = &snapshot.healthcheck;
+        let healthy = match self
+            .client
+            .get(probe_url(&self.target, healthcheck))
+            .timeout(healthcheck.timeout)
+            .send()
+            .await
+        {
+            Ok(response) => healthcheck
                 .expected_statuses
                 .contains(&response.status().as_u16()),
             Err(error) => {
@@ -219,9 +236,10 @@ impl BackgroundService for HealthProber {
     async fn start(&self, mut shutdown: ShutdownWatch) {
         loop {
             self.probe_once().await;
+            let interval = self.settings.load().healthcheck.interval;
             tokio::select! {
                 _ = shutdown.changed() => return,
-                _ = tokio::time::sleep(self.target.healthcheck.interval) => {}
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     }
@@ -229,12 +247,12 @@ impl BackgroundService for HealthProber {
 
 /// The URL of one active probe: `Upstream` origin + path prefix +
 /// healthcheck path.
-fn probe_url(target: &UpstreamTarget) -> String {
+fn probe_url(target: &UpstreamTarget, healthcheck: &HealthcheckSettings) -> String {
     format!(
         "{}{}{}",
         target.base_url(),
         target.path_prefix,
-        target.healthcheck.path
+        healthcheck.path
     )
 }
 
@@ -245,15 +263,25 @@ mod tests {
 
     use crate::config::Config;
 
-    fn tracker(unhealthy_threshold: u32, healthy_threshold: u32) -> UpstreamHealthTracker {
-        UpstreamHealthTracker::new(HealthcheckSettings {
-            path: "/".to_string(),
-            expected_statuses: vec![200],
-            interval: Duration::from_secs(10),
-            timeout: Duration::from_secs(2),
-            unhealthy_threshold,
-            healthy_threshold,
-        })
+    fn tracker(yaml_healthcheck: &str) -> UpstreamHealthTracker {
+        let yaml = format!(
+            "server:\n\
+             \x20 data_plane_addr: \"127.0.0.1:18080\"\n\
+             \x20 admin_addr: \"127.0.0.1:18081\"\n\
+             upstream:\n\
+             \x20 url: \"http://127.0.0.1:18082\"\n\
+             \x20 healthcheck:\n{yaml_healthcheck}"
+        );
+        let config = Config::from_str(&yaml, "<test config>").expect("parse test config");
+        UpstreamHealthTracker::new(crate::config::shared_settings(&config))
+    }
+
+    /// Tracker with the given hysteresis thresholds.
+    fn simple_tracker(unhealthy_threshold: u32, healthy_threshold: u32) -> UpstreamHealthTracker {
+        tracker(&format!(
+            "\x20 \x20 unhealthy_threshold: {unhealthy_threshold}\n\
+             \x20 \x20 healthy_threshold: {healthy_threshold}\n"
+        ))
     }
 
     fn upstream_target(yaml_upstream: &str) -> UpstreamTarget {
@@ -271,13 +299,13 @@ mod tests {
 
     #[test]
     fn starts_healthy() {
-        assert!(tracker(3, 2).is_healthy());
-        assert_eq!(tracker(3, 2).health(), UpstreamHealth::Healthy);
+        assert!(simple_tracker(3, 2).is_healthy());
+        assert_eq!(simple_tracker(3, 2).health(), UpstreamHealth::Healthy);
     }
 
     #[test]
     fn flips_unhealthy_after_the_failure_threshold() {
-        let tracker = tracker(3, 2);
+        let tracker = simple_tracker(3, 2);
         tracker.report_probe_failure();
         tracker.report_probe_failure();
         assert!(
@@ -294,7 +322,7 @@ mod tests {
 
     #[test]
     fn success_resets_the_failure_streak_while_healthy() {
-        let tracker = tracker(2, 2);
+        let tracker = simple_tracker(2, 2);
         tracker.report_probe_failure();
         tracker.report_probe_success();
         tracker.report_passive_failure();
@@ -303,7 +331,7 @@ mod tests {
 
     #[test]
     fn flips_healthy_after_the_success_threshold() {
-        let tracker = tracker(1, 2);
+        let tracker = simple_tracker(1, 2);
         tracker.report_probe_failure();
         tracker.report_probe_success();
         assert!(
@@ -316,7 +344,7 @@ mod tests {
 
     #[test]
     fn failure_resets_the_success_streak_while_unhealthy() {
-        let tracker = tracker(1, 2);
+        let tracker = simple_tracker(1, 2);
         tracker.report_probe_failure();
         tracker.report_probe_success();
         tracker.report_passive_failure();
@@ -331,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_healthy_resumes_on_the_transition_to_healthy() {
-        let tracker = Arc::new(tracker(1, 1));
+        let tracker = Arc::new(simple_tracker(1, 1));
         tracker.report_probe_failure();
         let flipper = Arc::clone(&tracker);
         tokio::spawn(async move {
@@ -348,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_healthy_returns_on_shutdown() {
-        let tracker = tracker(1, 1);
+        let tracker = simple_tracker(1, 1);
         tracker.report_probe_failure();
         let (shutdown_tx, mut shutdown) = watch::channel(false);
         shutdown_tx.send(true).expect("signal shutdown");
@@ -361,11 +389,17 @@ mod tests {
         let target = upstream_target(
             "\x20 url: \"http://127.0.0.1:18082\"\n\x20 healthcheck:\n\x20 \x20 path: \"/probe\"\n",
         );
-        assert_eq!(probe_url(&target), "http://127.0.0.1:18082/probe");
+        assert_eq!(
+            probe_url(&target, &target.healthcheck),
+            "http://127.0.0.1:18082/probe"
+        );
 
         let prefixed = upstream_target(
             "\x20 url: \"https://example.com:8443/sentry\"\n\x20 healthcheck:\n\x20 \x20 path: \"/\"\n",
         );
-        assert_eq!(probe_url(&prefixed), "https://example.com:8443/sentry/");
+        assert_eq!(
+            probe_url(&prefixed, &prefixed.healthcheck),
+            "https://example.com:8443/sentry/"
+        );
     }
 }

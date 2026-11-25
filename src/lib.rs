@@ -14,4 +14,6 @@ pub mod delivery;
 pub mod health;
 pub mod ingestion;
 pub mod rate_limit;
+pub mod reload;
+pub mod shutdown;
 pub mod wal;

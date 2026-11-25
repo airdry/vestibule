@@ -25,7 +25,7 @@ use reqwest::StatusCode;
 use tokio::sync::mpsc;
 
 use crate::codec::{Envelope, Payload};
-use crate::config::{BatchSettings, UpstreamTarget};
+use crate::config::{SharedSettings, UpstreamTarget};
 use crate::health::UpstreamHealthTracker;
 use crate::ingestion::{ForwardedMetadata, lock_wal};
 use crate::wal::{PendingRecord, Position, Wal};
@@ -66,13 +66,15 @@ enum Decision {
 }
 
 /// Forwards `Ingestion Queue` records to the `Upstream` through a bounded
-/// worker pool with a shared drain-rate throttle.
+/// worker pool with a shared drain-rate throttle. Batch and queue-TTL
+/// settings are read from the shared runtime settings snapshot on every
+/// dispatch cycle, so hot-reloads apply without restarting the pool.
 pub struct DeliveryPool {
     wal: Arc<Mutex<Wal>>,
     client: reqwest::Client,
     upstream: UpstreamTarget,
     policy: RetryPolicy,
-    settings: BatchSettings,
+    settings: SharedSettings,
     health: Arc<UpstreamHealthTracker>,
 }
 
@@ -87,7 +89,7 @@ impl DeliveryPool {
         wal: Arc<Mutex<Wal>>,
         upstream: UpstreamTarget,
         policy: RetryPolicy,
-        settings: BatchSettings,
+        settings: SharedSettings,
         health: Arc<UpstreamHealthTracker>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
@@ -107,10 +109,11 @@ impl DeliveryPool {
     /// Drains the queue until shutdown is requested, then flushes open
     /// batches and returns.
     pub async fn run(&self, mut shutdown: ShutdownWatch) {
-        let workers = self.settings.workers.max(1);
-        let (jobs_tx, jobs_rx) = mpsc::channel::<Job>(workers * 4);
-        let (events_tx, mut events_rx) = mpsc::channel::<Event>(workers * 4);
-        let throttle = Arc::new(DrainThrottle::new(self.settings.max_requests_per_sec));
+        let (jobs_tx, jobs_rx) = mpsc::channel::<Job>(64);
+        let (events_tx, mut events_rx) = mpsc::channel::<Event>(64);
+        let throttle = Arc::new(DrainThrottle::new(
+            self.settings.load().batch.max_requests_per_sec,
+        ));
         let jobs_rx = Arc::new(tokio::sync::Mutex::new(jobs_rx));
         let mut health_rx = self.health.subscribe();
         let worker_context = Arc::new(WorkerContext {
@@ -119,29 +122,38 @@ impl DeliveryPool {
             policy: self.policy.clone(),
             health: Arc::clone(&self.health),
         });
-
-        for _ in 0..workers {
-            tokio::spawn(run_worker(
-                Arc::clone(&worker_context),
-                Arc::clone(&jobs_rx),
-                events_tx.clone(),
-                Arc::clone(&throttle),
-                shutdown.clone(),
-            ));
-        }
+        let mut spawned_workers = 0;
 
         let mut dispatcher = Dispatcher {
-            settings: &self.settings,
+            wal: Arc::clone(&self.wal),
+            settings: Arc::clone(&self.settings),
             ledger: Ledger::default(),
             groups: HashMap::new(),
             seq: 0,
             jobs_tx,
-            wal: Arc::clone(&self.wal),
         };
-        let mut interval = tokio::time::interval(self.settings.flush_interval);
+        let mut flush_interval = self.settings.load().batch.flush_interval;
+        let mut interval = tokio::time::interval(flush_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
+            // Apply the current runtime settings snapshot: worker pool size,
+            // drain throttle rate and the queue record TTL.
+            let snapshot = self.settings.load_full();
+            let desired_workers = snapshot.batch.workers.max(1);
+            while spawned_workers < desired_workers {
+                spawned_workers += 1;
+                tokio::spawn(run_worker(
+                    Arc::clone(&worker_context),
+                    Arc::clone(&jobs_rx),
+                    events_tx.clone(),
+                    Arc::clone(&throttle),
+                    shutdown.clone(),
+                ));
+            }
+            throttle.set_rate(snapshot.batch.max_requests_per_sec);
+            lock_wal(&self.wal).set_max_age(snapshot.queue_max_age);
+
             // While Upstream Health is Unhealthy, workers pause: records
             // stay buffered in the Ingestion Queue instead of being claimed
             // and delivered.
@@ -161,6 +173,13 @@ impl DeliveryPool {
                 _ = interval.tick() => {
                     if healthy {
                         dispatcher.seal_all();
+                    }
+                    if snapshot.batch.flush_interval != flush_interval {
+                        flush_interval = snapshot.batch.flush_interval;
+                        interval = tokio::time::interval(flush_interval);
+                        interval.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Delay,
+                        );
                     }
                 }
                 changed = health_rx.changed() => {
@@ -200,9 +219,9 @@ enum Event {
 }
 
 /// The dispatcher owns claim/group/ledger state for one `run` invocation.
-struct Dispatcher<'a> {
+struct Dispatcher {
     wal: Arc<Mutex<Wal>>,
-    settings: &'a BatchSettings,
+    settings: SharedSettings,
     ledger: Ledger,
     groups: HashMap<GroupKey, Vec<Claim>>,
     seq: usize,
@@ -232,7 +251,7 @@ struct QueuedRecord {
     envelope: Option<Envelope>,
 }
 
-impl Dispatcher<'_> {
+impl Dispatcher {
     /// Claims records from the queue while the job channel has capacity.
     fn claim_records(&mut self) {
         while self.jobs_tx.capacity() > 0 {
@@ -268,6 +287,7 @@ impl Dispatcher<'_> {
 
     /// Routes a claim into a merge group or straight into an individual job.
     fn add(&mut self, claim: Claim) {
+        let settings = self.settings.load();
         if claim.record.envelope.is_some() {
             let key = GroupKey {
                 route: claim.record.route.clone(),
@@ -282,7 +302,7 @@ impl Dispatcher<'_> {
             group.push(claim);
             let items = group.len();
             let bytes: usize = group.iter().map(|claim| claim.record.body.len()).sum();
-            if items >= self.settings.max_items || bytes as u64 >= self.settings.max_bytes {
+            if items >= settings.batch.max_items || bytes as u64 >= settings.batch.max_bytes {
                 self.seal(&key);
             }
         } else {
@@ -583,9 +603,10 @@ impl Ledger {
     }
 }
 
-/// Token-bucket throttle bounding the outbound request rate.
+/// Token-bucket throttle bounding the outbound request rate. The rate is
+/// hot-reloadable: `set_rate` swaps it while the token state persists.
 struct DrainThrottle {
-    rate: f64,
+    rate: Mutex<f64>,
     state: Mutex<ThrottleState>,
 }
 
@@ -597,7 +618,7 @@ struct ThrottleState {
 impl DrainThrottle {
     fn new(rate: f64) -> Self {
         Self {
-            rate,
+            rate: Mutex::new(rate),
             state: Mutex::new(ThrottleState {
                 tokens: rate,
                 last: tokio::time::Instant::now(),
@@ -605,8 +626,20 @@ impl DrainThrottle {
         }
     }
 
+    /// Replaces the refill rate without resetting the token state.
+    fn set_rate(&self, rate: f64) {
+        *self
+            .rate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rate;
+    }
+
     async fn acquire(&self) {
         loop {
+            let rate = *self
+                .rate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let wait = {
                 let mut state = self
                     .state
@@ -614,13 +647,13 @@ impl DrainThrottle {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let now = tokio::time::Instant::now();
                 let elapsed = now.duration_since(state.last).as_secs_f64();
-                state.tokens = (state.tokens + elapsed * self.rate).min(self.rate);
+                state.tokens = (state.tokens + elapsed * rate).min(rate);
                 state.last = now;
                 if state.tokens >= 1.0 {
                     state.tokens -= 1.0;
                     return;
                 }
-                (1.0 - state.tokens) / self.rate
+                (1.0 - state.tokens) / rate
             };
             tokio::time::sleep(Duration::from_secs_f64(wait)).await;
         }

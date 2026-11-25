@@ -7,10 +7,58 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Deserializer};
 use url::Url;
+
+/// Lock-free shared snapshot store of the hot-reloadable
+/// [`RuntimeSettings`]: hot-path handlers load a consistent snapshot with
+/// one atomic read while reloads swap in a new one.
+pub type SharedSettings = Arc<ArcSwap<RuntimeSettings>>;
+
+/// Builds the shared settings store from the startup configuration.
+pub fn shared_settings(config: &Config) -> SharedSettings {
+    Arc::new(ArcSwap::from(Arc::new(config.runtime_settings())))
+}
+
+/// Structured log verbosity of the service (hot-reloadable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    /// Parses a log level name (case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` naming the offending value for unknown levels.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.to_ascii_lowercase().as_str() {
+            "trace" => Ok(Self::Trace),
+            "debug" => Ok(Self::Debug),
+            "info" => Ok(Self::Info),
+            "warn" | "warning" => Ok(Self::Warn),
+            "error" => Ok(Self::Error),
+            _ => Err(format!(
+                "unknown log level '{raw}' (expected one of trace, debug, info, warn, error)"
+            )),
+        }
+    }
+}
+
+/// Observability settings applied to logging and metrics (hot-reloadable).
+#[derive(Debug, Clone, Copy)]
+pub struct ObservabilitySettings {
+    pub log_level: LogLevel,
+}
 
 /// Errors surfaced when loading or validating the startup configuration.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +81,25 @@ pub struct Config {
     pub queue: QueueSettings,
     pub rate_limits: RateLimitSettings,
     pub batch: BatchSettings,
+    pub observability: ObservabilitySettings,
+}
+
+/// The hot-reloadable slice of the [`Config`] captured as one atomic
+/// snapshot.
+///
+/// Startup-only fields (the `server` listen addresses and `queue.dir`)
+/// deliberately stay out: changing them after startup cannot take effect
+/// and is only warned about during reload.
+#[derive(Debug, Clone)]
+pub struct RuntimeSettings {
+    pub ingest: IngestSettings,
+    /// `queue.max_age`: the record TTL applied during delivery.
+    pub queue_max_age: Duration,
+    pub batch: BatchSettings,
+    pub rate_limits: RateLimitSettings,
+    /// `upstream.healthcheck`: active probe settings.
+    pub healthcheck: HealthcheckSettings,
+    pub observability: ObservabilitySettings,
 }
 
 /// Outbound batched delivery settings of the delivery worker pool.
@@ -126,6 +193,7 @@ const DEFAULT_HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(10);
 const DEFAULT_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_HEALTHCHECK_UNHEALTHY_THRESHOLD: u32 = 3;
 const DEFAULT_HEALTHCHECK_HEALTHY_THRESHOLD: u32 = 2;
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Active probe settings driving `Upstream Health` transitions.
 #[derive(Debug, Clone)]
@@ -195,6 +263,8 @@ pub struct Rule {
 pub struct ServerSettings {
     pub data_plane_addr: SocketAddr,
     pub admin_addr: SocketAddr,
+    /// Graceful-shutdown deadline for in-flight work on `SIGTERM`.
+    pub shutdown_timeout: Duration,
 }
 
 /// Where `Pass-Through Traffic` is forwarded.
@@ -263,6 +333,12 @@ impl Config {
             "server.admin_addr",
         )?)
         .map_err(|message| Self::invalid(path, format!("server.admin_addr: {message}")))?;
+        let shutdown_timeout = non_zero_duration(
+            server.shutdown_timeout,
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            "server.shutdown_timeout",
+            path,
+        )?;
         let url = required_field(path, &upstream.url, "upstream.url")?;
         let timeout = upstream.timeout;
         let raw_healthcheck = upstream.healthcheck;
@@ -283,17 +359,32 @@ impl Config {
         let queue = Self::queue_from_raw(raw.queue, path)?;
         let rate_limits = Self::rate_limits_from_raw(raw.rate_limits, path)?;
         let batch = Self::batch_from_raw(raw.batch, path)?;
+        let observability = Self::observability_from_raw(raw.observability, path)?;
         Ok(Self {
             server: ServerSettings {
                 data_plane_addr,
                 admin_addr,
+                shutdown_timeout,
             },
             upstream,
             ingest,
             queue,
             rate_limits,
             batch,
+            observability,
         })
+    }
+
+    /// Extracts the hot-reloadable settings as one atomic snapshot.
+    pub fn runtime_settings(&self) -> RuntimeSettings {
+        RuntimeSettings {
+            ingest: self.ingest.clone(),
+            queue_max_age: self.queue.max_age,
+            batch: self.batch.clone(),
+            rate_limits: self.rate_limits.clone(),
+            healthcheck: self.upstream.healthcheck.clone(),
+            observability: self.observability,
+        }
     }
 
     fn batch_from_raw(raw: Option<RawBatch>, path: &str) -> Result<BatchSettings, ConfigError> {
@@ -530,6 +621,20 @@ impl Config {
             defaults,
             projects,
         })
+    }
+
+    fn observability_from_raw(
+        raw: Option<RawObservability>,
+        path: &str,
+    ) -> Result<ObservabilitySettings, ConfigError> {
+        let raw = raw.unwrap_or_default();
+        let log_level = raw
+            .log_level
+            .map(|level| LogLevel::parse(&level))
+            .transpose()
+            .map_err(|message| Self::invalid(path, format!("observability.log_level: {message}")))?
+            .unwrap_or(LogLevel::Info);
+        Ok(ObservabilitySettings { log_level })
     }
 
     fn missing_section(path: &str, section: &str, expected_keys: &str) -> ConfigError {
@@ -1074,6 +1179,93 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn parses_shutdown_timeout_with_default() {
+        let default_config = Config::from_str(&base_yaml(), "<test config>").unwrap();
+        assert_eq!(
+            default_config.server.shutdown_timeout,
+            Duration::from_secs(30)
+        );
+
+        let yaml = "server:\n\
+         \x20 data_plane_addr: \"127.0.0.1:18080\"\n\
+         \x20 admin_addr: \"127.0.0.1:18081\"\n\
+         \x20 shutdown_timeout: 5s\n\
+         upstream:\n\
+         \x20 url: \"http://127.0.0.1:18082\"\n";
+        let config = Config::from_str(yaml, "<test config>").unwrap();
+        assert_eq!(config.server.shutdown_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn rejects_non_positive_shutdown_timeout() {
+        let yaml = "server:\n\
+         \x20 data_plane_addr: \"127.0.0.1:18080\"\n\
+         \x20 admin_addr: \"127.0.0.1:18081\"\n\
+         \x20 shutdown_timeout: 0\n\
+         upstream:\n\
+         \x20 url: \"http://127.0.0.1:18082\"\n";
+        let error = Config::from_str(yaml, "<test config>").unwrap_err();
+        assert!(error.to_string().contains("shutdown_timeout"));
+    }
+
+    #[test]
+    fn parses_observability_log_level_with_default() {
+        let default_config = Config::from_str(&base_yaml(), "<test config>").unwrap();
+        assert_eq!(default_config.observability.log_level, LogLevel::Info);
+
+        let yaml = format!("{}observability:\n\x20 log_level: debug\n", base_yaml());
+        let config = Config::from_str(&yaml, "<test config>").unwrap();
+        assert_eq!(config.observability.log_level, LogLevel::Debug);
+    }
+
+    #[test]
+    fn rejects_unknown_log_level() {
+        let yaml = format!("{}observability:\n\x20 log_level: loud\n", base_yaml());
+        let error = Config::from_str(&yaml, "<test config>").unwrap_err();
+        assert!(error.to_string().contains("log_level"));
+    }
+
+    #[test]
+    fn extracts_hot_reloadable_runtime_settings() {
+        let yaml = format!(
+            "{}\
+             ingest:\n\
+             \x20 success_status_code: 200\n\
+             queue:\n\
+             \x20 dir: \"/tmp/wal\"\n\
+             \x20 max_age: 2h\n\
+             batch:\n\
+             \x20 max_items: 7\n\
+             rate_limits:\n\
+             \x20 defaults:\n\
+             \x20 \x20 event:\n\
+             \x20 \x20 \x20 rate: 5\n\
+             \x20 \x20 \x20 burst: 5\n\
+             observability:\n\
+             \x20 log_level: warn\n",
+            base_yaml()
+        );
+        let config = Config::from_str(&yaml, "<test config>").unwrap();
+        let runtime = config.runtime_settings();
+
+        assert_eq!(runtime.ingest.success_status_code, 200);
+        assert_eq!(runtime.queue_max_age, Duration::from_secs(2 * 60 * 60));
+        assert_eq!(runtime.batch.max_items, 7);
+        assert_eq!(runtime.observability.log_level, LogLevel::Warn);
+        assert_eq!(
+            runtime.rate_limits.defaults.event,
+            Some(Rule {
+                rate: 5.0,
+                burst: 5
+            })
+        );
+        assert_eq!(
+            runtime.healthcheck.path, "/",
+            "the healthcheck section is part of the hot-reloadable runtime settings"
+        );
+    }
 }
 
 /// The raw (not yet validated) YAML schema.
@@ -1086,6 +1278,7 @@ struct RawConfig {
     queue: Option<RawQueue>,
     rate_limits: Option<RawRateLimits>,
     batch: Option<RawBatch>,
+    observability: Option<RawObservability>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1185,11 +1378,19 @@ struct RawQueue {
     fsync_interval: Option<Duration>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawObservability {
+    log_level: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawServer {
     data_plane_addr: Option<String>,
     admin_addr: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    shutdown_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -52,3 +52,15 @@ _Avoid_: lock, lease, read
 **Merge Group**:
 A set of queued `/envelope/` records sharing one `(route, credentials)` key, eligible for merging into a single gzip-compressed Envelope on egress.
 _Avoid_: batch key, group key
+
+**Runtime Settings**:
+The hot-reloadable slice of the YAML configuration (rate limits, healthcheck, batching, queue TTL, success status code, log level), published as one atomic snapshot; startup-only fields (listen addresses, `queue.dir`) stay out.
+_Avoid_: dynamic config, live config, runtime config
+
+**Reload**:
+One validated application of the YAML configuration file to the Runtime Settings: load, validate, atomically swap in — or reject, keeping the previous Runtime Settings active. Triggered identically by the file watcher, `SIGHUP`, and Admin Plane `POST /reload`.
+_Avoid_: refresh, reconfigure, config push
+
+**Graceful Shutdown**:
+The `SIGTERM` sequence: `/readyz` flips to `503`, new connections stop being accepted, in-flight ingestion writes finish within `shutdown_timeout`, the Ingestion Queue and Checkpoint are flushed and `fsync`ed, and the process exits with code `0`.
+_Avoid_: drain mode, soft stop, termination handler

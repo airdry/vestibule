@@ -6,10 +6,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::codec::ItemCategory;
-use crate::config::{RateLimitSettings, Rule, ScopeRules};
+use crate::config::{RateLimitSettings, Rule, ScopeRules, SharedSettings};
 use crate::wal::Clock;
 
 /// The verdict for one item against its `Rate Limit Rule`.
@@ -33,11 +32,15 @@ pub struct CheckItem<'a> {
 }
 
 /// Local in-memory Token Bucket engine over a bounded LRU/TTL table.
+///
+/// The bucket table is process-local state that survives configuration
+/// hot-reloads: bounds (`max_buckets`, `bucket_ttl`) are read from the
+/// shared runtime settings snapshot on every check, so reloading changes
+/// the bounds without resetting active buckets.
 pub struct RateLimiter {
     table: Mutex<HashMap<BucketKey, Bucket>>,
     clock: Arc<dyn Clock>,
-    max_buckets: usize,
-    bucket_ttl_ms: u64,
+    settings: SharedSettings,
 }
 
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -54,12 +57,11 @@ struct Bucket {
 }
 
 impl RateLimiter {
-    pub fn new(clock: Arc<dyn Clock>, max_buckets: usize, bucket_ttl: Duration) -> Self {
+    pub fn new(clock: Arc<dyn Clock>, settings: SharedSettings) -> Self {
         Self {
             table: Mutex::new(HashMap::new()),
             clock,
-            max_buckets,
-            bucket_ttl_ms: bucket_ttl.as_millis() as u64,
+            settings,
         }
     }
 
@@ -75,12 +77,16 @@ impl RateLimiter {
             category: item.category,
         };
 
+        let snapshot = self.settings.load();
+        let max_buckets = snapshot.rate_limits.max_buckets;
+        let bucket_ttl_ms = snapshot.rate_limits.bucket_ttl.as_millis() as u64;
+
         let mut table = lock_table(&self.table);
         let bucket = match table.get_mut(&key) {
-            Some(bucket) if now.saturating_sub(bucket.last_used_ms) <= self.bucket_ttl_ms => bucket,
+            Some(bucket) if now.saturating_sub(bucket.last_used_ms) <= bucket_ttl_ms => bucket,
             _ => {
-                if table.len() >= self.max_buckets {
-                    evict_one(&mut table, now, self.bucket_ttl_ms);
+                if table.len() >= max_buckets {
+                    evict_one(&mut table, now, bucket_ttl_ms);
                 }
                 table.entry(key).or_insert(Bucket {
                     tokens: rule.burst as f64,
@@ -185,11 +191,27 @@ mod tests {
 
     use super::{CheckItem, Decision, RateLimiter, resolve_rule};
     use crate::codec::ItemCategory;
-    use crate::config::{RateLimitSettings, Rule, ScopeRules};
+    use crate::config::{Config, RateLimitSettings, Rule, ScopeRules, shared_settings};
     use crate::wal::Clock;
 
     fn rule(rate: f64, burst: u32) -> Option<Rule> {
         Some(Rule { rate, burst })
+    }
+
+    /// Builds shared settings with the given bucket table bounds.
+    fn shared_bounds(max_buckets: usize, bucket_ttl: Duration) -> crate::config::SharedSettings {
+        let yaml = format!(
+            "server:\n\
+             \x20 data_plane_addr: \"127.0.0.1:18080\"\n\
+             \x20 admin_addr: \"127.0.0.1:18081\"\n\
+             upstream:\n\
+             \x20 url: \"http://127.0.0.1:18082\"\n\
+             rate_limits:\n\
+             \x20 max_buckets: {max_buckets}\n\
+             \x20 bucket_ttl: {}ms\n",
+            bucket_ttl.as_millis()
+        );
+        shared_settings(&Config::from_str(&yaml, "<test config>").expect("parse test config"))
     }
 
     const RATE_1_RPS: Option<Rule> = Some(Rule {
@@ -360,7 +382,7 @@ mod tests {
 
     fn limiter_with(clock: &Arc<MockClock>, max_buckets: usize) -> RateLimiter {
         let clock: Arc<dyn Clock> = clock.clone();
-        RateLimiter::new(clock, max_buckets, Duration::from_secs(60))
+        RateLimiter::new(clock, shared_bounds(max_buckets, Duration::from_secs(60)))
     }
 
     #[test]

@@ -298,22 +298,47 @@ pub struct TestApp {
     pub data_plane_url: String,
     /// Admin Plane base URL (`http://127.0.0.1:<port>`).
     pub admin_url: String,
+    /// Data Plane listen address (for rebuilding config YAML).
+    pub data_plane_addr: SocketAddr,
+    /// Admin Plane listen address (for rebuilding config YAML).
+    pub admin_addr: SocketAddr,
 }
 
-/// Starts the real service in-process from a YAML configuration string and
-/// waits until both planes accept connections.
+impl TestApp {
+    /// The Data Plane port (for rebuilding config YAML).
+    pub fn data_plane_addr_port(&self) -> u16 {
+        self.data_plane_addr.port()
+    }
+
+    /// The Admin Plane port (for rebuilding config YAML).
+    pub fn admin_addr_port(&self) -> u16 {
+        self.admin_addr.port()
+    }
+}
+
+/// Starts the real service in-process from a YAML configuration string
+/// and waits until both planes accept connections.
 pub fn start_service(yaml: &str) -> TestApp {
-    let config = sentry_ratelimiter::config::Config::from_str(yaml, "<test config>")
+    start_service_from_config(&write_config(yaml))
+}
+
+/// Starts the real service in-process from a YAML configuration file (the
+/// same file the service watches for hot-reloads) and waits until both
+/// planes accept connections.
+pub fn start_service_from_config(config_path: &std::path::Path) -> TestApp {
+    let yaml = std::fs::read_to_string(config_path).expect("read test config");
+    let config = sentry_ratelimiter::config::Config::from_str(&yaml, "<test config>")
         .expect("parse test config");
     let data_plane_addr = config.server.data_plane_addr;
     let admin_addr = config.server.admin_addr;
 
+    let config_path = config_path.to_path_buf();
     let app_thread = thread::Builder::new()
         .name("sentry-ratelimiter-under-test".to_string())
         .spawn(move || {
             // Runs until the test process exits; errors would fail every test
             // through the readiness wait below.
-            let _run_result = sentry_ratelimiter::app::run(config);
+            let _run_result = sentry_ratelimiter::app::run(config, config_path);
         })
         .expect("spawn service thread");
 
@@ -325,6 +350,8 @@ pub fn start_service(yaml: &str) -> TestApp {
     TestApp {
         data_plane_url: format!("http://{data_plane_addr}"),
         admin_url: format!("http://{admin_addr}"),
+        data_plane_addr,
+        admin_addr,
     }
 }
 
@@ -392,6 +419,36 @@ impl ServiceProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    /// Sends the given POSIX signal (e.g. `"TERM"`, `"HUP"`) to the
+    /// process.
+    pub fn signal(&self, signal: &str) {
+        let status = std::process::Command::new("kill")
+            .arg(format!("-{signal}"))
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("send signal to service process");
+        assert!(status.success(), "failed to send SIG{signal}");
+    }
+
+    /// Sends `SIGTERM`, triggering a graceful shutdown.
+    pub fn sigterm(&self) {
+        self.signal("TERM");
+    }
+
+    /// Sends `SIGHUP`, triggering a config reload.
+    pub fn sighup(&self) {
+        self.signal("HUP");
+    }
+
+    /// Waits for the process to exit and returns its exit code.
+    pub fn wait(mut self) -> i32 {
+        self.child
+            .wait()
+            .expect("wait for service exit")
+            .code()
+            .unwrap_or(-1)
+    }
 }
 
 /// Extracts the configured plane addresses from a config YAML (tests only).
@@ -433,14 +490,32 @@ pub fn config_yaml(upstream_url: &str, data_plane_port: u16, admin_port: u16) ->
 
 /// Full YAML configuration with extra sections appended after `queue`.
 ///
-/// The `queue.dir` section is always included, pointing at a temporary
-/// directory kept for the lifetime of the process. The healthcheck probes
-/// a distinctive `PROBE_PATH` so tests can filter probes out of recorded
+/// The `queue.dir` section always included points at a temporary directory
+/// kept for the lifetime of the process. The healthcheck probes a
+/// distinctive `PROBE_PATH` so tests can filter probes out of recorded
 /// traffic.
 pub fn config_yaml_with(
     upstream_url: &str,
     data_plane_port: u16,
     admin_port: u16,
+    extra_sections: &str,
+) -> String {
+    config_yaml_for(
+        upstream_url,
+        data_plane_port,
+        admin_port,
+        &tempdir(),
+        extra_sections,
+    )
+}
+
+/// Full YAML configuration with an explicit `queue.dir` (kept stable across
+/// rewritten configs in hot-reload tests).
+pub fn config_yaml_for(
+    upstream_url: &str,
+    data_plane_port: u16,
+    admin_port: u16,
+    queue_dir: &std::path::Path,
     extra_sections: &str,
 ) -> String {
     format!(
@@ -453,7 +528,7 @@ pub fn config_yaml_with(
          \x20 \x20 path: \"{PROBE_PATH}\"\n\
          queue:\n\
          \x20 dir: \"{}\"\n{extra_sections}",
-        tempdir().display(),
+        queue_dir.display(),
     )
 }
 
