@@ -86,6 +86,7 @@ pub struct MockUpstream {
     pub addr: SocketAddr,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     response: Arc<Mutex<ResponsePlan>>,
+    path_responses: Arc<Mutex<Vec<(String, ResponsePlan)>>>,
 }
 
 /// The mock `Upstream` response schedule.
@@ -93,6 +94,10 @@ enum ResponsePlan {
     Single(UpstreamResponse),
     Sequence(Vec<UpstreamResponse>),
 }
+
+/// The distinctive healthcheck path injected into every test configuration,
+/// so active probes can be told apart from forwarded traffic.
+pub const PROBE_PATH: &str = "/healthcheck-probe";
 
 impl ResponsePlan {
     fn next(&mut self) -> UpstreamResponse {
@@ -120,9 +125,11 @@ impl MockUpstream {
 
         let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
         let response = Arc::new(Mutex::new(ResponsePlan::Single(response)));
+        let path_responses: Arc<Mutex<Vec<(String, ResponsePlan)>>> = Arc::default();
 
         let requests_for_task = Arc::clone(&requests);
         let response_for_task = Arc::clone(&response);
+        let path_responses_for_task = Arc::clone(&path_responses);
         thread::Builder::new()
             .name("mock-upstream".to_string())
             .spawn(move || {
@@ -137,8 +144,9 @@ impl MockUpstream {
                         let (stream, _) = listener.accept().await.expect("accept connection");
                         let requests = Arc::clone(&requests_for_task);
                         let response = Arc::clone(&response_for_task);
+                        let path_responses = Arc::clone(&path_responses_for_task);
                         tokio::spawn(async move {
-                            serve_connection(stream, requests, response).await;
+                            serve_connection(stream, requests, response, path_responses).await;
                         });
                     }
                 });
@@ -149,6 +157,7 @@ impl MockUpstream {
             addr,
             requests,
             response,
+            path_responses,
         }
     }
 
@@ -167,6 +176,16 @@ impl MockUpstream {
         *self.response.lock().expect("lock response") = ResponsePlan::Single(response);
     }
 
+    /// Replaces the response schedule served to requests whose path starts
+    /// with `path_prefix`, shadowing the default schedule. Active health
+    /// probes (which hit `PROBE_PATH`) keep following the default schedule,
+    /// keeping response sequences deterministic for delivery tests.
+    pub fn set_responses_for_path(&self, path_prefix: &str, responses: Vec<UpstreamResponse>) {
+        let mut plans = self.path_responses.lock().expect("lock path responses");
+        plans.retain(|(prefix, _)| prefix != path_prefix);
+        plans.push((path_prefix.to_string(), ResponsePlan::Sequence(responses)));
+    }
+
     /// Serves the given responses one per incoming request; after the
     /// sequence is exhausted, every request is answered with `500`.
     pub fn set_responses(&self, responses: Vec<UpstreamResponse>) {
@@ -178,10 +197,12 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     response: Arc<Mutex<ResponsePlan>>,
+    path_responses: Arc<Mutex<Vec<(String, ResponsePlan)>>>,
 ) {
     let service = service_fn(move |request: Request<hyper::body::Incoming>| {
         let requests = Arc::clone(&requests);
         let response = Arc::clone(&response);
+        let path_responses = Arc::clone(&path_responses);
         async move {
             let (parts, body) = request.into_parts();
             let body = body
@@ -211,12 +232,22 @@ async fn serve_connection(
                 body,
                 recorded_at: Instant::now(),
             };
-            requests.lock().expect("lock requests").push(recorded);
 
             let spec = {
-                let mut plan = response.lock().expect("lock responses");
-                plan.next()
+                let path = recorded.path.as_str();
+                let mut path_plans = path_responses.lock().expect("lock path responses");
+                match path_plans
+                    .iter_mut()
+                    .find(|(prefix, _)| path.strip_prefix(prefix.as_str()).is_some())
+                {
+                    Some((_, plan)) => plan.next(),
+                    None => {
+                        let mut plan = response.lock().expect("lock responses");
+                        plan.next()
+                    }
+                }
             };
+            requests.lock().expect("lock requests").push(recorded);
             tokio::time::sleep(spec.latency).await;
             let mut builder = Response::builder().status(spec.status);
             for (name, value) in spec.headers {
@@ -229,6 +260,16 @@ async fn serve_connection(
     let _ = hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
         .await;
+}
+
+/// All requests recorded so far except active health probes (which hit
+/// the distinctive `PROBE_PATH` configured into every test service).
+pub fn non_probe_requests(upstream: &MockUpstream) -> Vec<RecordedRequest> {
+    upstream
+        .recorded_requests()
+        .into_iter()
+        .filter(|request| request.path != PROBE_PATH)
+        .collect()
 }
 
 /// Picks a free localhost port by briefly binding to `127.0.0.1:0`.
@@ -393,7 +434,9 @@ pub fn config_yaml(upstream_url: &str, data_plane_port: u16, admin_port: u16) ->
 /// Full YAML configuration with extra sections appended after `queue`.
 ///
 /// The `queue.dir` section is always included, pointing at a temporary
-/// directory kept for the lifetime of the process.
+/// directory kept for the lifetime of the process. The healthcheck probes
+/// a distinctive `PROBE_PATH` so tests can filter probes out of recorded
+/// traffic.
 pub fn config_yaml_with(
     upstream_url: &str,
     data_plane_port: u16,
@@ -406,6 +449,8 @@ pub fn config_yaml_with(
          \x20 admin_addr: \"127.0.0.1:{admin_port}\"\n\
          upstream:\n\
          \x20 url: \"{upstream_url}\"\n\
+         \x20 healthcheck:\n\
+         \x20 \x20 path: \"{PROBE_PATH}\"\n\
          queue:\n\
          \x20 dir: \"{}\"\n{extra_sections}",
         tempdir().display(),

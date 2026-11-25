@@ -121,6 +121,43 @@ const DEFAULT_BATCH_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_BATCH_WORKERS: usize = 4;
 const DEFAULT_BATCH_MAX_REQUESTS_PER_SEC: f64 = 100.0;
+const DEFAULT_HEALTHCHECK_PATH: &str = "/";
+const DEFAULT_HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_HEALTHCHECK_UNHEALTHY_THRESHOLD: u32 = 3;
+const DEFAULT_HEALTHCHECK_HEALTHY_THRESHOLD: u32 = 2;
+
+/// Active probe settings driving `Upstream Health` transitions.
+#[derive(Debug, Clone)]
+pub struct HealthcheckSettings {
+    /// Path appended to the `Upstream` base URL for active probes.
+    pub path: String,
+    /// Probe response statuses counted as healthy.
+    pub expected_statuses: Vec<u16>,
+    /// Period between active probes.
+    pub interval: Duration,
+    /// Timeout of one active probe request.
+    pub timeout: Duration,
+    /// Consecutive failures (active or passive) that flip `Upstream
+    /// Health` to `Unhealthy`.
+    pub unhealthy_threshold: u32,
+    /// Consecutive probe successes that restore `Upstream Health` to
+    /// `Healthy`.
+    pub healthy_threshold: u32,
+}
+
+impl Default for HealthcheckSettings {
+    fn default() -> Self {
+        Self {
+            path: DEFAULT_HEALTHCHECK_PATH.to_string(),
+            expected_statuses: vec![200],
+            interval: DEFAULT_HEALTHCHECK_INTERVAL,
+            timeout: DEFAULT_HEALTHCHECK_TIMEOUT,
+            unhealthy_threshold: DEFAULT_HEALTHCHECK_UNHEALTHY_THRESHOLD,
+            healthy_threshold: DEFAULT_HEALTHCHECK_HEALTHY_THRESHOLD,
+        }
+    }
+}
 
 /// `Rate Limit Rule` settings: hierarchical rules plus bucket table bounds.
 #[derive(Debug, Clone, Default)]
@@ -171,6 +208,8 @@ pub struct UpstreamTarget {
     pub path_prefix: String,
     /// Per-request delivery timeout towards the `Upstream`.
     pub timeout: Duration,
+    /// Active probe settings for `Upstream Health` tracking.
+    pub healthcheck: HealthcheckSettings,
 }
 
 /// Loads and validates the YAML configuration from `path`.
@@ -226,6 +265,7 @@ impl Config {
         .map_err(|message| Self::invalid(path, format!("server.admin_addr: {message}")))?;
         let url = required_field(path, &upstream.url, "upstream.url")?;
         let timeout = upstream.timeout;
+        let raw_healthcheck = upstream.healthcheck;
         let mut upstream = UpstreamTarget::from_url(url)
             .map_err(|message| Self::invalid(path, format!("upstream.url: {message}")))?;
         if let Some(timeout) = timeout {
@@ -237,6 +277,7 @@ impl Config {
             }
             upstream.timeout = timeout;
         };
+        upstream.healthcheck = Self::healthcheck_from_raw(raw_healthcheck, path)?;
 
         let ingest = Self::ingest_from_raw(raw.ingest, path)?;
         let queue = Self::queue_from_raw(raw.queue, path)?;
@@ -294,6 +335,82 @@ impl Config {
             flush_interval,
             workers,
             max_requests_per_sec,
+        })
+    }
+
+    fn healthcheck_from_raw(
+        raw: Option<RawHealthcheck>,
+        path: &str,
+    ) -> Result<HealthcheckSettings, ConfigError> {
+        let Some(raw) = raw else {
+            return Ok(HealthcheckSettings::default());
+        };
+
+        let healthcheck_path = raw
+            .path
+            .unwrap_or_else(|| DEFAULT_HEALTHCHECK_PATH.to_string());
+        if !healthcheck_path.starts_with('/') {
+            return Err(Self::invalid(
+                path,
+                format!("upstream.healthcheck.path must start with '/', got '{healthcheck_path}'"),
+            ));
+        }
+
+        let expected_statuses = raw.expected_statuses.unwrap_or_else(|| vec![200]);
+        if expected_statuses.is_empty() {
+            return Err(Self::invalid(
+                path,
+                "upstream.healthcheck.expected_statuses must not be empty".to_string(),
+            ));
+        }
+        if expected_statuses
+            .iter()
+            .any(|status| !(100..600).contains(status))
+        {
+            return Err(Self::invalid(
+                path,
+                format!(
+                    "upstream.healthcheck.expected_statuses must be valid HTTP statuses (100-599), got {expected_statuses:?}"
+                ),
+            ));
+        }
+
+        let threshold =
+            |value: Option<u32>, default: u32, name: &str| -> Result<u32, ConfigError> {
+                match value.unwrap_or(default) {
+                    0 => Err(Self::invalid(
+                        path,
+                        format!("upstream.healthcheck.{name} must be at least 1"),
+                    )),
+                    threshold => Ok(threshold),
+                }
+            };
+
+        Ok(HealthcheckSettings {
+            path: healthcheck_path,
+            expected_statuses,
+            interval: non_zero_duration(
+                raw.interval,
+                DEFAULT_HEALTHCHECK_INTERVAL,
+                "upstream.healthcheck.interval",
+                path,
+            )?,
+            timeout: non_zero_duration(
+                raw.timeout,
+                DEFAULT_HEALTHCHECK_TIMEOUT,
+                "upstream.healthcheck.timeout",
+                path,
+            )?,
+            unhealthy_threshold: threshold(
+                raw.unhealthy_threshold,
+                DEFAULT_HEALTHCHECK_UNHEALTHY_THRESHOLD,
+                "unhealthy_threshold",
+            )?,
+            healthy_threshold: threshold(
+                raw.healthy_threshold,
+                DEFAULT_HEALTHCHECK_HEALTHY_THRESHOLD,
+                "healthy_threshold",
+            )?,
         })
     }
 
@@ -607,8 +724,28 @@ impl UpstreamTarget {
             port,
             path_prefix,
             timeout: DEFAULT_UPSTREAM_TIMEOUT,
+            healthcheck: HealthcheckSettings::default(),
         })
     }
+
+    /// The `Upstream` origin (`scheme://host[:port]`) without any path.
+    pub fn base_url(&self) -> String {
+        let port = if is_default_port(self.tls, self.port) {
+            String::new()
+        } else {
+            format!(":{}", self.port)
+        };
+        format!(
+            "{}://{}{}",
+            if self.tls { "https" } else { "http" },
+            self.host,
+            port
+        )
+    }
+}
+
+fn is_default_port(tls: bool, port: u16) -> bool {
+    if tls { port == 443 } else { port == 80 }
 }
 
 #[cfg(test)]
@@ -871,6 +1008,72 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn parses_upstream_healthcheck_settings() {
+        let yaml = format!(
+            "{}\
+\
+             \x20 timeout: 5s\n\
+             \x20 healthcheck:\n\
+             \x20 \x20 path: \"/health\"\n\
+             \x20 \x20 expected_statuses: [200, 204]\n\
+             \x20 \x20 interval: 250ms\n\
+             \x20 \x20 timeout: 1s\n\
+             \x20 \x20 unhealthy_threshold: 2\n\
+             \x20 \x20 healthy_threshold: 3\n",
+            base_yaml()
+        );
+
+        let config = Config::from_str(&yaml, "<test config>").unwrap();
+        let healthcheck = &config.upstream.healthcheck;
+
+        assert_eq!(healthcheck.path, "/health");
+        assert_eq!(healthcheck.expected_statuses, [200, 204]);
+        assert_eq!(healthcheck.interval, Duration::from_millis(250));
+        assert_eq!(healthcheck.timeout, Duration::from_secs(1));
+        assert_eq!(healthcheck.unhealthy_threshold, 2);
+        assert_eq!(healthcheck.healthy_threshold, 3);
+    }
+
+    #[test]
+    fn applies_default_healthcheck_settings() {
+        let config = Config::from_str(&base_yaml(), "<test config>").unwrap();
+        let healthcheck = &config.upstream.healthcheck;
+
+        assert_eq!(healthcheck.path, "/");
+        assert_eq!(healthcheck.expected_statuses, [200]);
+        assert_eq!(healthcheck.interval, Duration::from_secs(10));
+        assert_eq!(healthcheck.timeout, Duration::from_secs(2));
+        assert_eq!(healthcheck.unhealthy_threshold, 3);
+        assert_eq!(healthcheck.healthy_threshold, 2);
+    }
+
+    #[test]
+    fn rejects_invalid_healthcheck_values() {
+        for bad in [
+            "path: no-leading-slash",
+            "expected_statuses: []",
+            "expected_statuses: [99]",
+            "expected_statuses: [600]",
+            "interval: 0",
+            "timeout: 0",
+            "unhealthy_threshold: 0",
+            "healthy_threshold: 0",
+        ] {
+            let yaml = format!(
+                "{}\n\
+                 \x20 healthcheck:\n\
+                 \x20 \x20 {bad}\n",
+                base_yaml()
+            );
+            let error = Config::from_str(&yaml, "<test config>").unwrap_err();
+            assert!(
+                error.to_string().contains("healthcheck"),
+                "error for {bad} must name the section: {error}"
+            );
+        }
+    }
 }
 
 /// The raw (not yet validated) YAML schema.
@@ -995,4 +1198,18 @@ struct RawUpstream {
     url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_duration")]
     timeout: Option<Duration>,
+    healthcheck: Option<RawHealthcheck>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawHealthcheck {
+    path: Option<String>,
+    expected_statuses: Option<Vec<u16>>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    interval: Option<Duration>,
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    timeout: Option<Duration>,
+    unhealthy_threshold: Option<u32>,
+    healthy_threshold: Option<u32>,
 }

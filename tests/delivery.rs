@@ -10,11 +10,12 @@ use support::{MockUpstream, UpstreamResponse, http_client};
 
 use std::io::Read as _;
 
-/// Spins up the service with the given upstream response plan and posts one
-/// ingestion request.
+/// Spins up the service with the given response plan for delivery requests
+/// on the envelope route. Active health probes always receive `200`, so
+/// response sequences stay deterministic.
 fn start_delivery(upstream_responses: Vec<UpstreamResponse>) -> (support::TestApp, MockUpstream) {
     let upstream = MockUpstream::start(UpstreamResponse::ok("ignored"));
-    upstream.set_responses(upstream_responses);
+    upstream.set_responses_for_path("/api/42/envelope/", upstream_responses);
     let config = support::config_yaml_with(
         &upstream.url(),
         support::ephemeral_port(),
@@ -86,8 +87,8 @@ fn queued_payload_is_delivered_to_upstream_with_metadata() {
 
     ingest(&app, r#"{"event_id":"aaa"}"#);
 
-    wait_until(|| !upstream.recorded_requests().is_empty());
-    let forwarded = &upstream.recorded_requests()[0];
+    wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    let forwarded = &support::non_probe_requests(&upstream)[0];
     assert_eq!(forwarded.method, "POST");
     assert_eq!(forwarded.path, "/api/42/envelope/?sentry_key=abc123");
     assert_eq!(
@@ -108,8 +109,8 @@ fn upstream_500_is_retried_with_backoff_until_success() {
 
     ingest(&app, "payload");
 
-    wait_until(|| upstream.recorded_requests().len() >= 3);
-    let requests = upstream.recorded_requests();
+    wait_until(|| support::non_probe_requests(&upstream).len() >= 3);
+    let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
         3,
@@ -126,8 +127,8 @@ fn throttled_429_pauses_the_worker_for_retry_after() {
 
     ingest(&app, "payload");
 
-    wait_until(|| upstream.recorded_requests().len() >= 2);
-    let requests = upstream.recorded_requests();
+    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    let requests = support::non_probe_requests(&upstream);
     assert_eq!(requests.len(), 2);
     let retry_gap = requests[1]
         .recorded_at
@@ -148,8 +149,8 @@ fn unrecoverable_4xx_drops_the_record_and_does_not_block_the_queue() {
     ingest(&app, "bad payload");
     ingest(&app, "good payload");
 
-    wait_until(|| upstream.recorded_requests().len() >= 2);
-    let requests = upstream.recorded_requests();
+    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
         2,
@@ -168,13 +169,14 @@ fn unrecoverable_4xx_drops_the_record_and_does_not_block_the_queue() {
 
 #[test]
 fn upstream_timeout_is_retried_and_delivered_on_the_next_attempt() {
-    let upstream = MockUpstream::start(
-        UpstreamResponse::with_status(200).with_latency(Duration::from_millis(800)),
+    let upstream = MockUpstream::start(UpstreamResponse::ok("ignored"));
+    upstream.set_responses_for_path(
+        "/api/42/envelope/",
+        vec![
+            UpstreamResponse::with_status(200).with_latency(Duration::from_millis(800)),
+            UpstreamResponse::ok("ok"),
+        ],
     );
-    upstream.set_responses(vec![
-        UpstreamResponse::with_status(200).with_latency(Duration::from_millis(800)),
-        UpstreamResponse::ok("ok"),
-    ]);
     let config = format!(
         "server:\n\
          \x20 data_plane_addr: \"127.0.0.1:{}\"\n\
@@ -182,19 +184,22 @@ fn upstream_timeout_is_retried_and_delivered_on_the_next_attempt() {
          upstream:\n\
          \x20 url: \"{}\"\n\
          \x20 timeout: 200ms\n\
+         \x20 healthcheck:\n\
+         \x20 \x20 path: \"{}\"\n\
          queue:\n\
          \x20 dir: \"{}\"\n",
         support::ephemeral_port(),
         support::ephemeral_port(),
         upstream.url(),
+        support::PROBE_PATH,
         support::tempdir().display(),
     );
     let app = support::start_service(&config);
 
     ingest(&app, "payload");
 
-    wait_until(|| upstream.recorded_requests().len() >= 2);
-    let requests = upstream.recorded_requests();
+    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    let requests = support::non_probe_requests(&upstream);
     assert!(requests.iter().any(|r| r.body == b"payload".to_vec()));
 }
 
@@ -212,10 +217,10 @@ fn compatible_envelopes_are_merged_into_one_gzip_request() {
     ingest_envelope(&app, "first", "abc123");
     ingest_envelope(&app, "second", "abc123");
 
-    wait_until(|| !upstream.recorded_requests().is_empty());
+    wait_until(|| !support::non_probe_requests(&upstream).is_empty());
     // Give the second record a chance to join the same batch.
     std::thread::sleep(Duration::from_millis(300));
-    let requests = upstream.recorded_requests();
+    let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
         1,
@@ -253,8 +258,8 @@ fn different_sentry_keys_are_never_merged() {
     ingest_envelope(&app, "first", "abc123");
     ingest_envelope(&app, "second", "def456");
 
-    wait_until(|| upstream.recorded_requests().len() >= 2);
-    let requests = upstream.recorded_requests();
+    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
         2,
@@ -283,8 +288,8 @@ fn a_single_envelope_record_is_flushed_after_flush_interval() {
 
     ingest_envelope(&app, "single", "abc123");
 
-    wait_until(|| !upstream.recorded_requests().is_empty());
-    let requests = upstream.recorded_requests();
+    wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    let requests = support::non_probe_requests(&upstream);
     assert_eq!(requests.len(), 1, "exactly one flush must happen");
     let request = &requests[0];
     assert_eq!(request.path, "/api/42/envelope/?sentry_key=abc123");

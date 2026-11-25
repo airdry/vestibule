@@ -11,6 +11,7 @@ pub mod config;
 pub mod data_plane;
 pub mod decompression;
 pub mod delivery;
+pub mod health;
 pub mod ingestion;
 pub mod rate_limit;
 pub mod wal;

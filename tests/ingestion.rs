@@ -69,7 +69,7 @@ fn ingestion_route_is_accepted_immediately_with_201() {
         "accepted ingestion must return an empty JSON body"
     );
     assert!(
-        upstream.recorded_requests().is_empty(),
+        support::non_probe_requests(&upstream).is_empty(),
         "ingestion must not reach Upstream synchronously"
     );
     assert_queue_has_records(&queue_dir);
@@ -93,7 +93,7 @@ fn oversized_ingestion_body_is_rejected_with_413() {
 
     assert_eq!(response.status().as_u16(), 413);
     assert!(
-        upstream.recorded_requests().is_empty(),
+        support::non_probe_requests(&upstream).is_empty(),
         "rejected payloads must not reach Upstream"
     );
     let segments = std::fs::read_dir(&queue_dir)
@@ -112,7 +112,7 @@ fn legacy_store_route_is_ingested() {
     let response = post_envelope(&app, "/api/store/");
 
     assert_eq!(response.status().as_u16(), 201);
-    assert!(upstream.recorded_requests().is_empty());
+    assert!(support::non_probe_requests(&upstream).is_empty());
 }
 
 /// Gzip-compresses a request body for the compressed-payload tests.
@@ -176,8 +176,8 @@ fn multi_item_envelope_reports_event_id_and_passes_through_upstream() {
         "accepted envelopes echo their header event_id"
     );
 
-    support::wait_until(|| !upstream.recorded_requests().is_empty());
-    let forwarded = &upstream.recorded_requests()[0];
+    support::wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    let forwarded = &support::non_probe_requests(&upstream)[0];
     assert_eq!(forwarded.path, "/api/42/envelope/");
     assert_eq!(forwarded.body, multi_item_envelope());
 }
@@ -201,8 +201,8 @@ fn compressed_envelope_is_ingested_and_delivered_intact() {
         "{\"id\":\"84df5a5f-51d8-409a-9416-a1adb4b0e3d0\"}"
     );
 
-    support::wait_until(|| !upstream.recorded_requests().is_empty());
-    let forwarded = &upstream.recorded_requests()[0];
+    support::wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    let forwarded = &support::non_probe_requests(&upstream)[0];
     assert_eq!(
         forwarded.body, compressed,
         "raw compressed bytes must be forwarded"
@@ -224,7 +224,7 @@ fn decompressed_body_over_the_limit_is_rejected_with_413() {
         .expect("POST zip bomb");
 
     assert_eq!(response.status().as_u16(), 413);
-    assert!(upstream.recorded_requests().is_empty());
+    assert!(support::non_probe_requests(&upstream).is_empty());
     let segments = std::fs::read_dir(&queue_dir)
         .expect("read queue dir")
         .filter_map(|entry| entry.ok())
@@ -253,8 +253,8 @@ fn corrupt_compressed_body_fails_open_as_raw_bytes() {
         .expect("POST corrupted body");
 
     assert_eq!(response.status().as_u16(), 201);
-    support::wait_until(|| !upstream.recorded_requests().is_empty());
-    assert_eq!(upstream.recorded_requests()[0].body, corrupted);
+    support::wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    assert_eq!(support::non_probe_requests(&upstream)[0].body, corrupted);
 }
 
 #[test]

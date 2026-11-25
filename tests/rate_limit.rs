@@ -84,8 +84,8 @@ fn all_items_rate_limited_receives_429_with_headers() {
         .unwrap();
     assert!(limits.contains(":event:42"), "got {limits:?}");
     // Nothing was enqueued for the throttled request.
-    support::wait_until(|| upstream.recorded_requests().len() >= 2);
-    assert_eq!(upstream.recorded_requests().len(), 2);
+    support::wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    assert_eq!(support::non_probe_requests(&upstream).len(), 2);
 }
 
 #[test]
@@ -108,8 +108,8 @@ fn partially_throttled_envelope_strips_items_and_reports_limits() {
 
     // Only the kept items are enqueued: the upstream receives the rebuilt
     // envelope without the throttled second transaction.
-    support::wait_until(|| !upstream.recorded_requests().is_empty());
-    let body = String::from_utf8(upstream.recorded_requests()[0].body.clone()).unwrap();
+    support::wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    let body = String::from_utf8(support::non_probe_requests(&upstream)[0].body.clone()).unwrap();
     assert!(body.contains("\"m\":1"), "event item missing: {body:?}");
     assert!(
         body.contains("\"t\":1"),

@@ -35,7 +35,7 @@ fn proxies_root_path_to_upstream_preserving_status_and_body() {
     assert_eq!(response.status().as_u16(), 200);
     assert_eq!(response.text().expect("read body"), "upstream body");
 
-    let forwarded = upstream.recorded_requests();
+    let forwarded = support::non_probe_requests(&upstream);
     assert_eq!(forwarded.len(), 1);
     assert_eq!(forwarded[0].method, "GET");
     assert_eq!(forwarded[0].path, "/");
@@ -51,7 +51,7 @@ fn preserves_upstream_error_status_codes() {
         .expect("GET through the Data Plane");
 
     assert_eq!(response.status().as_u16(), 503);
-    assert!(upstream.recorded_requests().len() == 1);
+    assert!(support::non_probe_requests(&upstream).len() == 1);
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn forwards_request_headers_query_and_body() {
 
     assert_eq!(response.status().as_u16(), 200);
 
-    let forwarded = &upstream.recorded_requests()[0];
+    let forwarded = &support::non_probe_requests(&upstream)[0];
     assert_eq!(forwarded.method, "POST");
     assert_eq!(
         forwarded.path,
@@ -109,7 +109,7 @@ fn preserves_client_host_header() {
         .send()
         .expect("GET through the Data Plane");
 
-    let forwarded = &upstream.recorded_requests()[0];
+    let forwarded = &support::non_probe_requests(&upstream)[0];
     assert_eq!(forwarded.header("host"), Some("sentry.example.com"));
 }
 
@@ -130,6 +130,6 @@ fn proxies_every_pass_through_path_untouched(#[case] path: &str) {
         .expect("GET through the Data Plane");
 
     assert_eq!(response.status().as_u16(), 200, "path {path}");
-    let forwarded = &upstream.recorded_requests()[0];
+    let forwarded = &support::non_probe_requests(&upstream)[0];
     assert_eq!(forwarded.path, path);
 }

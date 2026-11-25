@@ -111,6 +111,17 @@ impl WalError {
     }
 }
 
+/// Snapshot of pending `Ingestion Queue` work, reported on `/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueUtilization {
+    /// On-disk bytes of records not yet committed past the checkpoint.
+    pub pending_bytes: u64,
+    /// Number of segment files currently on disk.
+    pub segments: u64,
+    /// Age of the oldest pending record; `None` when fully drained.
+    pub oldest_entry_age: Option<Duration>,
+}
+
 /// The durable `Ingestion Queue` stored in `queue.dir`.
 pub struct Wal {
     dir: PathBuf,
@@ -297,6 +308,47 @@ impl Wal {
         self.active_file
             .sync_data()
             .map_err(|source| WalError::io("fsync segment", source))
+    }
+
+    /// Reports the queue utilization for `GET /status`: on-disk bytes of
+    /// records still pending beyond the checkpoint, the number of segment
+    /// files, and the age of the oldest pending record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WalError`] when segment files cannot be read.
+    pub fn utilization(&self) -> Result<QueueUtilization, WalError> {
+        let segment_ids = list_segment_ids(&self.dir)?;
+        let mut pending_bytes = 0;
+        let mut oldest: Option<u64> = None;
+        let now = self.clock.now_unix_ms();
+        for &segment_id in segment_ids
+            .iter()
+            .filter(|id| **id >= self.checkpoint.segment_id)
+        {
+            let mut file = open_segment_file(&self.dir, segment_id)?;
+            let mut offset = if segment_id == self.checkpoint.segment_id {
+                self.checkpoint.offset
+            } else {
+                0
+            };
+            while let Some(frame) = read_frame_at(&mut file, offset)
+                .inspect_err(|error| eprintln!("wal: skipping unreadable frame: {error:?}"))
+                .ok()
+                .flatten()
+            {
+                pending_bytes += frame.len as u64;
+                oldest = Some(oldest.map_or(frame.record.enqueued_at_unix_ms, |oldest| {
+                    oldest.min(frame.record.enqueued_at_unix_ms)
+                }));
+                offset += frame.len as u64;
+            }
+        }
+        Ok(QueueUtilization {
+            pending_bytes,
+            segments: segment_ids.len() as u64,
+            oldest_entry_age: oldest.map(|at| Duration::from_millis(now.saturating_sub(at))),
+        })
     }
 
     fn rotate_segment(&mut self) -> Result<(), WalError> {
@@ -675,6 +727,50 @@ mod tests {
             .collect();
         files.sort();
         files
+    }
+
+    #[test]
+    fn utilization_reports_pending_bytes_segments_and_oldest_age() {
+        let dir = tempdir();
+        let clock = MockClock::new(1_000);
+        let mut wal = Wal::open(&dir, &test_settings(&dir), clock.clone()).expect("open wal");
+        append_record(&mut wal, 1);
+        clock.advance_ms(5_000);
+        append_record(&mut wal, 2);
+
+        let before = wal.utilization().expect("read queue utilization");
+        assert_eq!(before.segments, 1, "both records share one segment");
+        assert_eq!(
+            before.oldest_entry_age,
+            Some(std::time::Duration::from_millis(5_000)),
+            "the age is measured from the oldest pending record"
+        );
+        assert!(before.pending_bytes > 0);
+
+        // Committing the first record leaves only the second one pending.
+        let first = wal.next_record().expect("read record").expect("record");
+        wal.commit(first.position).expect("commit record");
+        let after = wal.utilization().expect("read queue utilization");
+        assert!(
+            after.pending_bytes < before.pending_bytes,
+            "committed bytes no longer count as pending"
+        );
+        assert_eq!(
+            after.oldest_entry_age,
+            Some(std::time::Duration::ZERO),
+            "the oldest pending record was enqueued at the current mock time"
+        );
+    }
+
+    #[test]
+    fn utilization_of_a_drained_queue_has_no_oldest_entry() {
+        let dir = tempdir();
+        let wal = Wal::open(&dir, &test_settings(&dir), MockClock::new(1_000)).expect("open wal");
+
+        let drained = wal.utilization().expect("read queue utilization");
+        assert_eq!(drained.pending_bytes, 0);
+        assert_eq!(drained.segments, 1, "the active segment file exists");
+        assert_eq!(drained.oldest_entry_age, None);
     }
 
     #[test]

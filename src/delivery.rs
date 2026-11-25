@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 
 use crate::codec::{Envelope, Payload};
 use crate::config::{BatchSettings, UpstreamTarget};
+use crate::health::UpstreamHealthTracker;
 use crate::ingestion::{ForwardedMetadata, lock_wal};
 use crate::wal::{PendingRecord, Position, Wal};
 
@@ -72,6 +73,7 @@ pub struct DeliveryPool {
     upstream: UpstreamTarget,
     policy: RetryPolicy,
     settings: BatchSettings,
+    health: Arc<UpstreamHealthTracker>,
 }
 
 impl DeliveryPool {
@@ -86,6 +88,7 @@ impl DeliveryPool {
         upstream: UpstreamTarget,
         policy: RetryPolicy,
         settings: BatchSettings,
+        health: Arc<UpstreamHealthTracker>,
     ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(upstream.timeout)
@@ -97,6 +100,7 @@ impl DeliveryPool {
             upstream,
             policy,
             settings,
+            health,
         })
     }
 
@@ -108,14 +112,19 @@ impl DeliveryPool {
         let (events_tx, mut events_rx) = mpsc::channel::<Event>(workers * 4);
         let throttle = Arc::new(DrainThrottle::new(self.settings.max_requests_per_sec));
         let jobs_rx = Arc::new(tokio::sync::Mutex::new(jobs_rx));
+        let mut health_rx = self.health.subscribe();
+        let worker_context = Arc::new(WorkerContext {
+            client: self.client.clone(),
+            target: self.upstream.clone(),
+            policy: self.policy.clone(),
+            health: Arc::clone(&self.health),
+        });
 
         for _ in 0..workers {
             tokio::spawn(run_worker(
+                Arc::clone(&worker_context),
                 Arc::clone(&jobs_rx),
                 events_tx.clone(),
-                self.client.clone(),
-                self.upstream.clone(),
-                self.policy.clone(),
                 Arc::clone(&throttle),
                 shutdown.clone(),
             ));
@@ -133,7 +142,13 @@ impl DeliveryPool {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
-            dispatcher.claim_records();
+            // While Upstream Health is Unhealthy, workers pause: records
+            // stay buffered in the Ingestion Queue instead of being claimed
+            // and delivered.
+            let healthy = self.health.is_healthy();
+            if healthy {
+                dispatcher.claim_records();
+            }
             tokio::select! {
                 _ = shutdown.changed() => {
                     dispatcher.seal_all();
@@ -144,7 +159,14 @@ impl DeliveryPool {
                     None => return,
                 },
                 _ = interval.tick() => {
-                    dispatcher.seal_all();
+                    if healthy {
+                        dispatcher.seal_all();
+                    }
+                }
+                changed = health_rx.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
                 }
             }
         }
@@ -425,20 +447,39 @@ fn target_url(route: &str, metadata: &ForwardedMetadata) -> String {
     target
 }
 
-async fn run_worker(
-    jobs_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
-    events_tx: mpsc::Sender<Event>,
+/// Shared context handed to every delivery worker.
+struct WorkerContext {
     client: reqwest::Client,
     target: UpstreamTarget,
     policy: RetryPolicy,
+    health: Arc<UpstreamHealthTracker>,
+}
+
+async fn run_worker(
+    context: Arc<WorkerContext>,
+    jobs_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
+    events_tx: mpsc::Sender<Event>,
     throttle: Arc<DrainThrottle>,
     mut shutdown: ShutdownWatch,
 ) {
     while let Some(job) = { jobs_rx.lock().await.recv().await } {
-        let mut backoff = policy.initial_backoff;
+        let mut backoff = context.policy.initial_backoff;
         loop {
+            // Pause outbound delivery while Upstream Health is Unhealthy;
+            // resume as soon as active probes restore Healthy.
+            if !context.health.is_healthy() && !context.health.wait_healthy(&mut shutdown).await {
+                return;
+            }
             throttle.acquire().await;
-            match send(&client, &target, &job.request, &policy).await {
+            match send(
+                &context.client,
+                &context.target,
+                &job.request,
+                &context.policy,
+                &context.health,
+            )
+            .await
+            {
                 Decision::Commit => {
                     let _ = events_tx.send(Event::Done(job.ids.clone())).await;
                     break;
@@ -448,7 +489,7 @@ async fn run_worker(
                         _ = shutdown.changed() => return,
                         _ = tokio::time::sleep(backoff) => {}
                     }
-                    backoff = (backoff * 2).min(policy.max_backoff);
+                    backoff = (backoff * 2).min(context.policy.max_backoff);
                 }
                 Decision::Throttle(pause) => {
                     tokio::select! {
@@ -461,12 +502,15 @@ async fn run_worker(
     }
 }
 
-/// Performs one delivery attempt and classifies the outcome.
+/// Performs one delivery attempt, classifies the outcome, and reports
+/// passive failures (transport errors, timeouts, `502`/`503`/`504`) to
+/// the health tracker.
 async fn send(
     client: &reqwest::Client,
     target: &UpstreamTarget,
     request: &OutboundRequest,
     policy: &RetryPolicy,
+    health: &UpstreamHealthTracker,
 ) -> Decision {
     let url = format!(
         "{}://{}{}{}",
@@ -487,9 +531,13 @@ async fn send(
         Ok(response) => response,
         Err(error) => {
             eprintln!("delivery: request to Upstream failed: {error}");
+            health.report_passive_failure();
             return Decision::Retry;
         }
     };
+    if matches!(response.status().as_u16(), 502..=504) {
+        health.report_passive_failure();
+    }
     let retry_after = response
         .headers()
         .get("retry-after")

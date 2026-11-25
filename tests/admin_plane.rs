@@ -63,7 +63,10 @@ fn admin_plane_does_not_proxy_to_upstream() {
         .expect("GET /healthz on the Admin Plane");
 
     assert!(
-        upstream.recorded_requests().is_empty(),
+        upstream
+            .recorded_requests()
+            .iter()
+            .all(|request| request.path != "/healthz"),
         "admin probes must not be forwarded to the Upstream"
     );
 }
