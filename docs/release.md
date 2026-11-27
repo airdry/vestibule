@@ -46,7 +46,10 @@ the image still builds.
    ```bash
    gh run download --name vestibule-image-sha-<sha>
    docker load --input vestibule-image.tar
+   docker run --rm vestibule:<version> --help
    ```
+   The tarball carries two tags: `vestibule:<version>` from `Cargo.toml` and
+   `vestibule:sha-<short sha>` for the commit it was built from.
 
 Nothing reaches `ghcr.io` from a pull request.
 
