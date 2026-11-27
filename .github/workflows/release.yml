@@ -1,29 +1,37 @@
 name: Release
 
 # Publishing is the only workflow that touches a registry or a GitHub Release.
-# It runs for `v*` tags and, after a `workflow_dispatch`, only from the `release`
-# environment, which is configured with required reviewers: the image is never
-# published without a human approval.
+# It runs when a pull request lands on main (and for `v*` tags and manual runs),
+# and always targets the version declared in Cargo.toml: the image tag and the
+# crate version cannot drift. Pushing the image additionally requires an approval
+# of the `release` environment, so nothing reaches GHCR unapproved.
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to release, for example v1.0.0"
-        required: true
+        description: "Tag or branch to publish (defaults to the dispatched ref)"
+        required: false
         type: string
+      force:
+        description: "Republish even if the version tag already exists"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # Workflow-level inputs are empty outside `workflow_dispatch`.
+  TAG_INPUT: ${{ inputs.tag }}
   REGISTRY: ghcr.io
 
 jobs:
@@ -32,7 +40,7 @@ jobs:
     uses: ./.github/workflows/quality-gates.yml
 
   verify:
-    name: Verify tag matches Cargo.toml
+    name: Read the crate version
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
@@ -41,20 +49,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.sha }}
 
-      # The image tag and the crate version must not drift: `v1.0.0` may only be
-      # released from a Cargo.toml that declares `version = "1.0.0"`.
-      - name: Compare tag with crate version
+      # The image tag follows Cargo.toml, which keeps the published image and the
+      # crate version in sync. When the run was started by a tag, that tag must
+      # agree as well: `v1.0.0` may only be released from `version = "1.0.0"`.
+      - name: Determine version
         id: version
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           echo "crate=$version" >> "$GITHUB_OUTPUT"
-          if [ "v$version" != "$RELEASE_TAG" ]; then
-            echo "::error::tag $RELEASE_TAG does not match Cargo.toml version $version"
+
+          ref_tag="$TAG_INPUT"
+          if [ -z "$ref_tag" ] && [ "${GITHUB_REF%%/*}" = "refs" ] && [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            ref_tag="$GITHUB_REF_NAME"
+          fi
+          if [ -n "$ref_tag" ] && [ "v$version" != "$ref_tag" ]; then
+            echo "::error::tag $ref_tag does not match Cargo.toml version $version"
             exit 1
           fi
-          echo "Releasing $RELEASE_TAG (crate version $version)."
+          echo "Publishing version $version."
 
   publish:
     name: Publish image to GHCR
@@ -71,24 +85,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.tag || github.sha }}
           fetch-depth: 0
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Every release is addressed by an explicit version, a moving minor or
-      # major tag, or its commit. There is no `latest`: consumers pin a release
-      # line instead of silently following whatever was published last. A 0.x
-      # release additionally gets no major tag, because it makes no stability
-      # promise.
+      # Every main push runs this workflow, but a version must be published once:
+      # an immutable `X.Y.Z` tag may not be moved to a later commit by an
+      # unrelated merge. `force: true` on a manual run overrides the guard.
       - name: Compute image tags
         id: meta
         run: |
@@ -98,12 +103,14 @@ jobs:
           short_sha=$(git rev-parse --short HEAD)
           image="$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/vestibule"
 
+          # No `latest`: consumers pin a release line instead of following
+          # whatever was published last. A 0.x version gets no major tag either,
+          # because it makes no stability promise.
           tags=("$image:$version" "$image:${version%.*}")
           if [ "${version%%.*}" != "0" ]; then
             tags+=("$image:${version%%.*}")
           fi
           tags+=("$image:sha-$short_sha")
-
           taglist=$(printf ', %s' "${tags[@]}")
 
           {
@@ -117,10 +124,28 @@ jobs:
             echo "TAGS"
           } >> "$GITHUB_OUTPUT"
 
-      # Pushed only after the release environment approval. Two exporters run in
-      # one build: the registry (the public package) and a local tarball that is
-      # attached to the GitHub Release for download without a registry login.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether the version is already published
+        id: exists
+        run: |
+          if docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:${{ needs.verify.outputs.version }}" > /dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ needs.verify.outputs.version }} is already published; nothing to push."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Two exporters in one build: the registry (the public package) and a local
+      # tarball that is attached to the GitHub Release for download without a
+      # registry login.
       - name: Build and push
+        if: ${{ inputs.force || steps.exists.outputs.published == 'false' }}
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -140,10 +165,11 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Publish GitHub Release
+        if: ${{ inputs.force || steps.exists.outputs.published == 'false' }}
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: ${{ env.RELEASE_TAG }}
+          tag_name: v${{ needs.verify.outputs.version }}
+          name: v${{ needs.verify.outputs.version }}
           generate_release_notes: true
           body: |
             Container image (public, no login required to pull):
@@ -160,11 +186,11 @@ jobs:
       - name: Report published image
         run: |
           {
-            echo "### Published"
+            echo "### Published image"
             echo ""
             echo "\`${{ steps.meta.outputs.image }}\`"
             echo ""
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "${{ steps.meta.outputs.taglist }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

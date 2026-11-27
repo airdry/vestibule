@@ -11,7 +11,7 @@ the pinned tool versions in `mise.toml` are the single source of truth.
 | --- | --- | --- | --- |
 | Quality gates | `quality-gates.yml` | Called by the two workflows below | Rust 1.100.0, `cargo-deny` 0.22.0 and `cargo-machete` 0.10.1 from `mise.toml`; runs `fmt-check`, `machete`, `deny`, `lint`, `test` |
 | CI | `ci.yml` | `pull_request` to `main`, `push` to `main`, manual | Runs the gates, then builds the production `Dockerfile` **without publishing** and uploads the image as a workflow artifact |
-| Release | `release.yml` | `v*` tags, manual | Verifies the tag against `Cargo.toml`, runs the gates, waits for approval of the `release` environment, pushes the image to GHCR and creates a GitHub Release |
+| Release | `release.yml` | `push` to `main`, `v*` tags, manual | Reads the version from `Cargo.toml`, runs the gates, waits for approval of the `release` environment and pushes the image to GHCR (skipping versions that are already published) and creates a GitHub Release |
 
 All runners are GitHub-hosted `ubuntu-26.04` (`x64`). Currency of every
 third-party action is a major-version pin, for example `actions/checkout@v7`.
@@ -48,28 +48,33 @@ Nothing reaches `ghcr.io` from a pull request.
 
 ## Releasing
 
-The published artifact is the container image `ghcr.io/airdry/vestibule`. No
-separate binary archive is shipped.
+The published artifact is the container image `ghcr.io/airdry/vestibule`, tagged
+with the version from `Cargo.toml`. No separate binary archive is shipped and no
+git tag is required to publish.
 
-1. Bump `version` in `Cargo.toml` (and refresh `Cargo.lock` with
-   `cargo build --locked`) and merge the bump into `main`.
-2. Tag the merged commit and push the tag:
-   ```bash
-   git tag v1.0.0
-   git push origin v1.0.0
-   ```
-3. `Release` starts. `Verify tag matches Cargo.toml` fails the run when the tag
-   and the crate version disagree, so image tags cannot drift from the manifest.
-4. `Publish image to GHCR` waits for the `release` environment approval. Merging
+1. Bump `version` in `Cargo.toml` (refresh `Cargo.lock` with `cargo build
+   --locked`) and merge the change into `main`.
+2. The merge triggers `Release`. `Quality gates` must pass and `Read the crate
+   version` reads the version from the merged `Cargo.toml`; when the run was
+   started by a `v*` tag, the tag itself must match (`v1.0.0` ← `version =
+   "1.0.0"`), so image tags cannot drift from the manifest.
+3. `Publish image to GHCR` waits for the `release` environment approval. Merging
    is not enough: a reviewer must approve the deployment before anything is
    pushed.
-5. After approval the workflow pushes the image, attaches the same image as a
-   `docker load`-able tarball to a generated GitHub Release, and prints the
-   result in the run summary.
+4. After approval the image is pushed to `ghcr.io/airdry/vestibule` with the
+   version tags described below, the same image is attached as a `docker
+   load`-able tarball to a generated GitHub Release, and the run summary lists
+   the published tags.
 
-The release can also be re-run for an existing tag with `workflow_dispatch`
-(input: the tag name, for example `v1.0.0`); it goes through the same gates,
-verification and approval.
+**A version is published once.** Every merge to `main` runs the workflow, so the
+`X.Y.Z` tag is checked against the registry first: when it already exists the
+push is skipped with a notice, because an immutable release tag must not move to
+a later commit. To republish deliberately, run `workflow_dispatch` with
+`force: true` and the ref to publish.
+
+The workflow can also be started for a specific tag or branch with
+`workflow_dispatch` (input: `tag`, for example `v1.0.0`); it goes through the
+same gates, version check and approval.
 
 ### Image tags
 
@@ -119,9 +124,12 @@ These settings live in the GitHub UI, not in the repository, and are required
 for the pipeline above:
 
 - **Environment `release`** (*Settings → Environments*) with required reviewers —
-  this is the approval gate in front of every publish.
+  this is the approval gate in front of every publish. GitHub creates the
+  environment on first use, but without reviewers the publish job runs
+  immediately, so the reviewers are what actually gate the push.
 - **Package visibility** (*Packages → vestibule → settings*) set to public, so the
-  image can be pulled anonymously.
+  image can be pulled anonymously. The push itself does not depend on it: the
+  image is in the registry either way, only anonymous pulls are affected.
 - **Workflow permissions** (*Settings → Actions → General*) allowing GitHub
   Actions to create and approve pull requests is **not** required; the workflows
   rely only on the built-in `GITHUB_TOKEN` with `contents: read` by default and
