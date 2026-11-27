@@ -3,6 +3,7 @@
 
 # Agent instructions (kept local, never committed)
 AGENTS.md
+docs/agents/
 
 # Rust build artifacts
 /target/
