@@ -43,8 +43,19 @@ description = "Run all tests"
 run = "cargo test --all"
 
 [tasks.gates]
-description = "Run every quality gate (fmt-check, lint, machete, deny, test)"
-depends = ["fmt-check", "lint", "machete", "deny", "test"]
+description = "Run every quality gate in CI order (fmt-check, machete, deny, lint, test)"
+# An ordered `run` array instead of `depends`: `depends` entries run in parallel
+# (up to `jobs`), which makes clippy and the test suite contend for the same
+# cargo `target/` lock and hides which gate failed first. The array runs the
+# gates one at a time and stops at the first failure, matching the order the CI
+# workflow uses: compile-free checks before the expensive build.
+run = [
+  { task = "fmt-check" },
+  { task = "machete" },
+  { task = "deny" },
+  { task = "lint" },
+  { task = "test" },
+]
 
 [tasks.sample-apps]
 description = "Build and start the sample applications with Docker Compose"
