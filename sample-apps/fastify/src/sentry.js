@@ -2,8 +2,8 @@ import * as Sentry from '@sentry/node';
 
 import { APP_NAME, logJson } from './json-console.js';
 
-const DEFAULT_DSN = 'http://public@host.docker.internal:8080/1';
-const DEFAULT_ENVIRONMENT = 'sample-apps';
+const DEFAULT_DSN = 'http://public@host.docker.internal:8080/2';
+const DEFAULT_ENVIRONMENT = 'production';
 const DEFAULT_RELEASE = 'sample-apps@local';
 
 function applyEnvironmentOverride(event) {

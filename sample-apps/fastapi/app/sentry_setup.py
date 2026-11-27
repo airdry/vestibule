@@ -11,7 +11,7 @@ from sentry_sdk.integrations.fastapi import FastApiIntegration
 logger = logging.getLogger("sample.fastapi.sentry")
 
 DEFAULT_DSN = "http://public@host.docker.internal:8080/1"
-DEFAULT_ENVIRONMENT = "sample-apps"
+DEFAULT_ENVIRONMENT = "production"
 DEFAULT_RELEASE = "sample-apps@local"
 
 

@@ -4,12 +4,12 @@ Three intentionally small applications used to exercise `sentry-ratelimiter`
 with different Sentry SDKs, languages, and HTTP frameworks, plus the rate
 limiter itself. Docker Compose starts four containers on one internal network:
 
-| Service              | Purpose                                                         |
-| -------------------- | --------------------------------------------------------------- |
-| `sentry-ratelimiter` | Production image built from the repository-root `Dockerfile`    |
-| `fastapi`            | Python 3.13 + FastAPI + `sentry-sdk[fastapi]` 2.23.1            |
-| `fastify`            | Node.js 22 + Fastify 5 + `@sentry/node` 9.6.0                    |
-| `fiber`              | Go 1.24 + Fiber 2 + `sentry-go` v0.31.0                          |
+| Service              | Project | Purpose                                                         |
+| -------------------- | ------- | --------------------------------------------------------------- |
+| `sentry-ratelimiter` | -       | Production image built from the repository-root `Dockerfile`    |
+| `fastapi`            | `1`     | Python 3.13 + FastAPI + `sentry-sdk[fastapi]` 2.23.1            |
+| `fastify`            | `2`     | Node.js 22 + Fastify 5 + `@sentry/node` 9.6.0                    |
+| `fiber`              | `3`     | Go 1.24 + Fiber 2 + `sentry-go` v0.31.0                          |
 
 The SDK versions are pinned to the releases that were current when
 Sentry self-hosted **25.3.0** shipped (2025-03-17). The framework versions are
@@ -74,26 +74,111 @@ curl http://localhost:8081/status
 curl http://localhost:8081/metrics
 ```
 
+## Continuous traffic generator
+
+[traffic.py](./traffic.py) is a [uv](https://docs.astral.sh/uv/) script with
+inline dependencies (`httpx`), so `uv run` resolves everything on first use. It
+sends `GET /events` and `GET /transactions` requests to all three sample apps in
+rounds and prints one line per request (status, item count, `flushed`, latency).
+
+```bash
+cd sample-apps
+uv run traffic.py                 # or: mise run sample-apps-traffic
+```
+
+`uv` is pinned in `mise.toml`, so `mise install` provides it; the script's
+`httpx` dependency is resolved by `uv` on first run.
+
+The three per-service variables control which endpoints each app receives:
+
+| Variable          | Default                   | Meaning                         |
+| ----------------- | ------------------------- | ------------------------------- |
+| `FASTAPI_TRAFFIC` | `events=5,transactions=1` | request mix for the FastAPI app |
+| `FASTIFY_TRAFFIC` | `events=5,transactions=1` | request mix for the Fastify app |
+| `FIBER_TRAFFIC`   | `events=5,transactions=1` | request mix for the Fiber app   |
+
+A mix is a comma-separated list of `kind` or `kind=weight`, where `kind` is
+`events` or `transactions`; `off` disables the service. The weighted list is
+cycled deterministically, so `events=5,transactions=1` sends five event
+requests for every transaction request.
+
+Per-service environments (cycled per round):
+
+| Variable               | Default                    | Meaning                          |
+| ---------------------- | -------------------------- | -------------------------------- |
+| `FASTAPI_ENVIRONMENTS` | `stage,production`         | environments for the FastAPI app |
+| `FASTIFY_ENVIRONMENTS` | `preprod,stage,production` | environments for the Fastify app |
+| `FIBER_ENVIRONMENTS`   | `preprod,stage,production` | environments for the Fiber app   |
+
+Global knobs:
+
+| Variable           | Default                 | Meaning                               |
+| ------------------ | ----------------------- | ------------------------------------- |
+| `TRAFFIC_INTERVAL` | `1.0`                   | seconds between rounds                |
+| `TRAFFIC_COUNT`    | `1`                     | items per request (1..1000)           |
+| `TRAFFIC_DURATION` | `0`                     | run time in seconds; `0` until Ctrl+C |
+| `TRAFFIC_TIMEOUT`  | `10.0`                  | per-request timeout in seconds        |
+| `FASTAPI_URL`      | `http://127.0.0.1:8001` | FastAPI base URL                      |
+| `FASTIFY_URL`      | `http://127.0.0.1:8002` | Fastify base URL                      |
+| `FIBER_URL`        | `http://127.0.0.1:8003` | Fiber base URL                        |
+
+Examples:
+
+```bash
+# only events from FastAPI, only transactions from Fiber, Fastify idle
+FASTAPI_TRAFFIC=events FASTIFY_TRAFFIC=off FIBER_TRAFFIC=transactions \
+  uv run traffic.py
+
+# 10 items per request, one round every 200 ms, for 60 seconds
+TRAFFIC_COUNT=10 TRAFFIC_INTERVAL=0.2 TRAFFIC_DURATION=60 uv run traffic.py
+
+# send only production traffic from every app
+FASTAPI_ENVIRONMENTS=production FASTIFY_ENVIRONMENTS=production \
+  FIBER_ENVIRONMENTS=production uv run traffic.py
+```
+
+The default environment lists exercise all three runtime environments from
+[sentry-ratelimiter.yaml](./sentry-ratelimiter.yaml): `preprod` (event rate
+10/s), `stage` (5/s), and `production` (1/s, tightened per project). With
+`TRAFFIC_COUNT=10` the production limits are hit almost immediately. Project
+`3` (fiber) overrides its `stage` limit (event rate 20/s), so fiber's stage
+traffic is accepted while its `preprod` and `production` traffic throttles.
+
+Because each app reports to its own project, `http_requests_total` and
+`ingest_items_total` are split by `project_id` (`1` = fastapi, `2` = fastify,
+`3` = fiber) and by `environment` (`preprod`, `stage`, `production`).
+
+Watch the effect on the rate limiter separately:
+
+```bash
+curl http://localhost:8081/metrics | rg 'http_requests_total|ingest_items_total'
+curl http://localhost:8081/status
+```
+
 ## Addresses inside the Compose network
 
 The sample apps use the rate limiter's Compose service name, not a host-side
-address:
+address. Each app reports to its own Sentry project, so the rate limiter keeps
+per-project rules and metric labels:
 
-```text
-http://public@sentry-ratelimiter:8080/1
-```
+| Service   | DSN inside the Compose network            | Project |
+| --------- | ----------------------------------------- | ------- |
+| `fastapi` | `http://public@sentry-ratelimiter:8080/1` | `1`     |
+| `fastify` | `http://public@sentry-ratelimiter:8080/2` | `2`     |
+| `fiber`   | `http://public@sentry-ratelimiter:8080/3` | `3`     |
 
-The project number (`1` in the DSN path) becomes the `project_id` used by the
-rate limiter's rules. Override the DSN only if you want to send the SDK traffic
-somewhere else:
+The project number (the last path segment) becomes the `project_id` used by the
+rate limiter's rules and metric labels. Override a single app's DSN only if you
+want to send its SDK traffic somewhere else:
 
 ```bash
-SENTRY_DSN='http://public@another-host:8080/1' docker compose up
+FASTIFY_SENTRY_DSN='http://public@another-host:8080/2' docker compose up
 ```
 
 You can also override:
 
-- `SENTRY_ENVIRONMENT` - default Sentry environment (default `sample-apps`);
+- `FASTAPI_SENTRY_DSN`, `FASTIFY_SENTRY_DSN`, `FIBER_SENTRY_DSN` - per-app DSNs;
+- `SENTRY_ENVIRONMENT` - default Sentry environment (default `production`);
 - `SENTRY_RELEASE` - default release name;
 - `LOG_LEVEL` - `trace`, `debug`, `info`, `warn`, or `error` (default `debug`);
 - `FASTAPI_PORT`, `FASTIFY_PORT`, `FIBER_PORT` - host-side app ports;
@@ -115,12 +200,23 @@ section:
 - `ingest` - accepted status code and body size limits;
 - `queue` - segmented disk WAL settings;
 - `batch` - asynchronous delivery batching and throttling;
-- `rate_limits` - global and project/environment rules;
+- `rate_limits` - global and project/environment rules (projects `1`-`3` map
+  to the three sample apps; `preprod`, `stage`, and `production` each have
+  their own limits, and project `3` overrides its `stage` limit to show that a
+  project can tune a single environment);
 - `observability` - log level and metric label allowlist.
 
 The Ingestion Queue is backed by the named volume
 `sentry-ratelimiter-queue` mounted at `/var/lib/sentry-ratelimiter/queue`, so
 buffered telemetry survives container recreation.
+
+Editing the mounted file on the host does not always reach the container's
+file watcher (the Compose mount is a single-file bind mount), so restart the
+service after changing the rules:
+
+```bash
+docker compose restart sentry-ratelimiter
+```
 
 The rate limiter container has no Compose-level `healthcheck`: the distroless
 image intentionally contains no shell or curl/wget. Use the Admin Plane
@@ -168,6 +264,7 @@ Set `LOG_LEVEL=trace` for the extra per-item detail emitted at trace level.
 sample-apps/
 ├── compose.yaml
 ├── sentry-ratelimiter.yaml  # mounted into the rate limiter container
+├── traffic.py               # uv traffic generator for the three apps
 ├── fastapi/                 # Python 3.13 + FastAPI + sentry-sdk 2.23.1
 ├── fastify/                 # Node.js 22 + Fastify 5 + @sentry/node 9.6.0
 └── fiber/                   # Go 1.24 + Fiber 2 + sentry-go v0.31.0

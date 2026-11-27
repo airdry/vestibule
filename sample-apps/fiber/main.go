@@ -32,8 +32,8 @@ import (
 
 const (
 	appName            = "fiber"
-	defaultDSN         = "http://public@host.docker.internal:8080/1"
-	defaultEnvironment = "sample-apps"
+	defaultDSN         = "http://public@host.docker.internal:8080/3"
+	defaultEnvironment = "production"
 	defaultRelease     = "sample-apps@local"
 	traceLevel         = slog.Level(-8)
 )

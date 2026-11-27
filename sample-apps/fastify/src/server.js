@@ -12,7 +12,7 @@ initSentry();
 
 const port = Number(process.env.PORT || 3000);
 const defaultEnvironment =
-  process.env.SENTRY_ENVIRONMENT || 'sample-apps';
+  process.env.SENTRY_ENVIRONMENT || 'production';
 
 const querystringSchema = {
   type: 'object',

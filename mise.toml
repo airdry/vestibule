@@ -6,8 +6,13 @@
 rust = "1.100.0"
 # Quality gates from AGENTS.md (mokevnin/dev-quality-gates#rust).
 cargo-deny = "0.22.0"
-"cargo:cargo-machete" = "0.10.1"
+# Use the prebuilt release binary: the `cargo:` backend compiles the crate and
+# therefore needs a host C toolchain, which breaks `mise run sample-apps` on
+# machines that only run the Docker stack.
+"github:bnjbvr/cargo-machete" = "0.10.1"
 cmake = "3"
+# Runs the sample-apps traffic generator (sample-apps/traffic.py).
+uv = "0.13.10"
 
 [tasks.fmt]
 description = "Format all Rust sources"
@@ -51,6 +56,11 @@ run = "docker compose build"
 description = "Follow the sample application logs"
 dir = "sample-apps"
 run = "docker compose logs -f"
+
+[tasks.sample-apps-traffic]
+description = "Generate continuous traffic against the sample applications"
+dir = "sample-apps"
+run = "uv run traffic.py"
 
 [tasks.sample-apps-down]
 description = "Stop the sample applications"

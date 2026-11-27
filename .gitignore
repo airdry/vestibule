@@ -11,3 +11,7 @@ sample-apps/fastapi/**/__pycache__/
 sample-apps/fastapi/**/*.pyc
 sample-apps/fiber/fiber-app
 sample-apps/fiber/fiber
+
+# Python tooling caches for the sample-apps traffic generator
+sample-apps/.ruff_cache/
+sample-apps/__pycache__/

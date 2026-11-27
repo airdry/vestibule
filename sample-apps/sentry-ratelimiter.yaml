@@ -59,7 +59,33 @@ rate_limits:
     other:
       rate: 10
       burst: 20
+    # The three runtime environments, each with its own limit. The most
+    # specific scope wins: project + environment + category.
+    environments:
+      preprod:
+        event:
+          rate: 10
+          burst: 20
+        transaction:
+          rate: 5
+          burst: 10
+      stage:
+        event:
+          rate: 5
+          burst: 10
+        transaction:
+          rate: 2
+          burst: 5
+      production:
+        event:
+          rate: 1
+          burst: 2
+        transaction:
+          rate: 1
+          burst: 2
   projects:
+    # Project ids match the DSN path of each sample application:
+    # 1 = fastapi, 2 = fastify, 3 = fiber.
     1:
       environments:
         production:
@@ -69,10 +95,37 @@ rate_limits:
           transaction:
             rate: 1
             burst: 2
+    2:
+      environments:
+        production:
+          event:
+            rate: 2
+            burst: 4
+          transaction:
+            rate: 1
+            burst: 2
+    3:
+      environments:
+        # Project-level override: fiber's stage limit is higher than the global
+        # stage limit and higher than its own preprod/production limits.
+        stage:
+          event:
+            rate: 20
+            burst: 40
+          transaction:
+            rate: 10
+            burst: 20
+        production:
+          event:
+            rate: 3
+            burst: 6
+          transaction:
+            rate: 2
+            burst: 4
 
 observability:
   log_level: "debug"
   environment_label_allowlist:
-    - sample-apps
+    - preprod
+    - stage
     - production
-    - staging

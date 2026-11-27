@@ -1,5 +1,12 @@
 name: sentry-ratelimiter-sample-apps
 
+# Environment shared by every sample application. Each service adds its own
+# SENTRY_DSN so the three apps report to different Sentry projects.
+x-sample-app-env: &sample-app-env
+  SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+  SENTRY_RELEASE: ${SENTRY_RELEASE:-sample-apps@local}
+  LOG_LEVEL: ${LOG_LEVEL:-debug}
+
 x-sample-app: &sample-app
   restart: unless-stopped
   init: true
@@ -14,12 +21,6 @@ x-sample-app: &sample-app
   depends_on:
     sentry-ratelimiter:
       condition: service_started
-  environment:
-    # Service name inside this Compose network, not host.docker.internal.
-    SENTRY_DSN: ${SENTRY_DSN:-http://public@sentry-ratelimiter:8080/1}
-    SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-sample-apps}
-    SENTRY_RELEASE: ${SENTRY_RELEASE:-sample-apps@local}
-    LOG_LEVEL: ${LOG_LEVEL:-debug}
 
 services:
   sentry-ratelimiter:
@@ -47,6 +48,11 @@ services:
     <<: *sample-app
     build:
       context: ./fastapi
+    environment:
+      <<: *sample-app-env
+      # Project 1. Service name inside this Compose network, not
+      # host.docker.internal.
+      SENTRY_DSN: ${FASTAPI_SENTRY_DSN:-http://public@sentry-ratelimiter:8080/1}
     ports:
       - "${FASTAPI_PORT:-8001}:8000"
 
@@ -54,6 +60,10 @@ services:
     <<: *sample-app
     build:
       context: ./fastify
+    environment:
+      <<: *sample-app-env
+      # Project 2.
+      SENTRY_DSN: ${FASTIFY_SENTRY_DSN:-http://public@sentry-ratelimiter:8080/2}
     ports:
       - "${FASTIFY_PORT:-8002}:3000"
 
@@ -61,6 +71,10 @@ services:
     <<: *sample-app
     build:
       context: ./fiber
+    environment:
+      <<: *sample-app-env
+      # Project 3.
+      SENTRY_DSN: ${FIBER_SENTRY_DSN:-http://public@sentry-ratelimiter:8080/3}
     ports:
       - "${FIBER_PORT:-8003}:8080"
 
