@@ -84,6 +84,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # A 0.x release is not a stable line: it gets its own version and minor
+      # tags plus the commit tag, but no major tag and no `latest` — a pre-1.0
+      # build must never become what `:latest` resolves to.
       - name: Compute image tags
         id: meta
         run: |
@@ -92,18 +95,23 @@ jobs:
           revision=$(git rev-parse HEAD)
           short_sha=$(git rev-parse --short HEAD)
           image="$REGISTRY/${GITHUB_REPOSITORY_OWNER,,}/vestibule"
+
+          tags=("$image:$version" "$image:${version%.*}")
+          if [ "${version%%.*}" != "0" ]; then
+            tags+=("$image:${version%%.*}" "$image:latest")
+          fi
+          tags+=("$image:sha-$short_sha")
+
+          taglist=$(printf ', %s' "${tags[@]}")
+
           {
             echo "image=$image"
             echo "created=$created"
             echo "revision=$revision"
             echo "short_sha=$short_sha"
-            echo "taglist=$image:$version, $image:${version%.*}, $image:${version%%.*}, $image:latest, $image:sha-$short_sha"
+            echo "taglist=${taglist#, }"
             echo "tags<<TAGS"
-            echo "$image:$version"
-            echo "$image:${version%.*}"
-            echo "$image:${version%%.*}"
-            echo "$image:latest"
-            echo "$image:sha-$short_sha"
+            printf '%s\n' "${tags[@]}"
             echo "TAGS"
           } >> "$GITHUB_OUTPUT"
 
