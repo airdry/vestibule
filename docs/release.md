@@ -9,7 +9,7 @@ the pinned tool versions in `mise.toml` are the single source of truth.
 
 | Workflow | File | Trigger | What it does |
 | --- | --- | --- | --- |
-| Quality gates | `quality-gates.yml` | Called by the two workflows below | Rust 1.100.0, `cargo-deny` 0.22.0 and `cargo-machete` 0.10.1 from `mise.toml`; runs `fmt-check`, `machete`, `deny`, `lint`, `test` |
+| Quality gates | `quality-gates.yml` | Called by the two workflows below | Rust 1.100.0, `cargo-deny` 0.22.0 and `cargo-machete` 0.10.1 from `mise.toml`; runs `fmt-check`, `machete`, `deny`, `lint-test` |
 | CI | `ci.yml` | `pull_request` to `main`, `push` to `main`, manual | Runs the gates, then builds the production `Dockerfile` **without publishing** and uploads the image as a workflow artifact |
 | Release | `release.yml` | `push` to `main`, `v*` tags, manual | Reads the version from `Cargo.toml`, runs the gates, waits for approval of the `release` environment and pushes the image to GHCR (skipping versions that are already published) and creates a GitHub Release |
 
@@ -25,12 +25,16 @@ Identical to the quality gates in `AGENTS.md`, executed through `mise`:
 | `rustfmt` | `mise run fmt-check` | `mise run fmt-check` |
 | unused dependencies | `mise run machete` | `mise run machete` |
 | advisories, licenses, bans, sources | `mise run deny` | `mise run deny` |
-| `clippy` with warnings denied | `mise run lint` | `mise run lint` |
-| test suite | `mise run test` | `mise run test` |
+| `clippy` with warnings denied and the test suite | `mise run lint-test` | `mise run lint-test` |
 
-`mise run gates` runs all five in dependency order. Every pull request against
-`main` must pass the `mise quality gates` check, and the pull request itself never
-publishes anything: it only proves that the image still builds.
+`mise run gates` runs all of them in order. `lint-test` covers the clippy and
+the test gate in a single compilation pass: `cargo clippy` only checks (rmeta),
+so a following `cargo test` would rebuild every dependency for codegen, while
+using `clippy-driver` as the workspace rustc wrapper lints the crate as it is
+built for the tests. `mise run lint` and `mise run test` still run either gate on
+its own. Every pull request against `main` must pass the `mise quality gates`
+check, and the pull request itself never publishes anything: it only proves that
+the image still builds.
 
 ## Pull requests
 

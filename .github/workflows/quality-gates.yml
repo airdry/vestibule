@@ -16,9 +16,22 @@ jobs:
     name: mise quality gates
     runs-on: ubuntu-26.04
     timeout-minutes: 45
+    env:
+      # Debug info is not needed in CI: dropping it cuts codegen time and keeps
+      # the cached `target/` directory roughly 40% smaller.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      # mise-action caches only its own data directory, while rustup keeps the
+      # toolchain in ~/.rustup. Without this cache the 1.100.0 toolchain and its
+      # components are downloaded again on every run.
+      - name: Cache the rustup toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.rustup/toolchains
+          key: rustup-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.toml') }}
 
       # Installs Rust 1.100.0, cargo-deny 0.22.0, cargo-machete 0.10.1 and cmake
       # at the versions pinned in mise.toml.
@@ -43,8 +56,8 @@ jobs:
       - name: cargo-deny (advisories, licenses, bans, sources)
         run: mise run deny
 
-      - name: clippy (warnings denied)
-        run: mise run lint
-
-      - name: cargo test
-        run: mise run test
+      # clippy and the test suite share one compilation pass: clippy-driver is
+      # the workspace rustc wrapper, so the crate is linted while it is built
+      # for the tests instead of being checked and then rebuilt.
+      - name: clippy + cargo test (single compilation pass)
+        run: mise run lint-test
