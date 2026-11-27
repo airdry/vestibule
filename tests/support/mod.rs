@@ -273,10 +273,26 @@ pub fn non_probe_requests(upstream: &MockUpstream) -> Vec<RecordedRequest> {
 }
 
 /// Picks a free localhost port by briefly binding to `127.0.0.1:0`.
+///
+/// Ports handed out in this process are never returned twice: parallel tests
+/// in one binary would otherwise be configured with the same port, and one
+/// service would silently answer for the other.
 pub fn ephemeral_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("read ephemeral port").port()
+    let mut allocated = ALLOCATED_PORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let allocated = allocated.get_or_insert_with(std::collections::HashSet::new);
+    loop {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = listener.local_addr().expect("read ephemeral port").port();
+        if allocated.insert(port) {
+            return port;
+        }
+    }
 }
+
+/// Ports already handed out by [`ephemeral_port`] in this process.
+static ALLOCATED_PORTS: Mutex<Option<std::collections::HashSet<u16>>> = Mutex::new(None);
 
 /// Blocks until `addr` accepts TCP connections (the service is listening).
 pub fn wait_until_listening(addr: SocketAddr) {
@@ -290,6 +306,19 @@ pub fn wait_until_listening(addr: SocketAddr) {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Blocks until the Admin Plane answers `GET /healthz` with `200`.
+///
+/// The listener is bound before the service can serve requests, so a bare
+/// TCP connect is not a readiness signal: early connections are reset.
+pub fn wait_until_ready(admin_url: &str) {
+    wait_until(|| {
+        http_client()
+            .get(format!("{admin_url}/healthz"))
+            .send()
+            .is_ok_and(|response| response.status().as_u16() == 200)
+    });
 }
 
 /// The running service under test, addressed over plain HTTP.
@@ -346,6 +375,7 @@ pub fn start_service_from_config(config_path: &std::path::Path) -> TestApp {
 
     wait_until_listening(data_plane_addr);
     wait_until_listening(admin_addr);
+    wait_until_ready(&format!("http://{admin_addr}"));
 
     TestApp {
         data_plane_url: format!("http://{data_plane_addr}"),
@@ -356,17 +386,36 @@ pub fn start_service_from_config(config_path: &std::path::Path) -> TestApp {
 }
 
 /// Blocks until `condition` holds or a 10s deadline passes.
-pub fn wait_until<F: Fn() -> bool>(condition: F) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+pub fn wait_until<F: FnMut() -> bool>(condition: F) {
+    wait_until_within(Duration::from_secs(10), condition);
+}
+
+/// Blocks until `condition` holds or `budget` passes.
+///
+/// Waits must observe real state (Prometheus metrics, recorded `Upstream`
+/// requests, `/readyz`) instead of sleeping for a guessed duration. Use a
+/// larger budget for waits that span a process restart or WAL recovery.
+pub fn wait_until_within<F: FnMut() -> bool>(budget: Duration, mut condition: F) {
+    let deadline = Instant::now() + budget;
     loop {
         if condition() {
             return;
         }
         if Instant::now() > deadline {
-            panic!("condition was not met within 10 seconds");
+            panic!("condition was not met within {budget:?}");
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Asserts that `condition` keeps holding for `window`.
+///
+/// This is the only way to check that something does *not* happen: no
+/// positive observable state can signal the end of the window, so the
+/// window itself is the assertion.
+pub fn assert_no_change_for<F: Fn() -> bool>(window: Duration, condition: F, message: &str) {
+    thread::sleep(window);
+    assert!(condition(), "{message}");
 }
 
 /// The service running as a real OS process (for restart-resilience tests).
@@ -406,6 +455,7 @@ impl ServiceProcess {
                 .parse()
                 .expect("parse admin addr"),
         );
+        wait_until_ready(&admin_url);
 
         Self {
             child,
@@ -554,8 +604,14 @@ pub fn metric_value(samples: &[MetricSample], name: &str, labels: &[(&str, &str)
 
 /// Fetches and parses the Admin Plane `/metrics` exposition.
 pub fn scrape_metrics(app: &TestApp) -> Vec<MetricSample> {
+    scrape_metrics_at(&app.admin_url)
+}
+
+/// Fetches and parses the `/metrics` exposition of the Admin Plane at
+/// `admin_url` (also usable for a service running as an OS process).
+pub fn scrape_metrics_at(admin_url: &str) -> Vec<MetricSample> {
     let response = http_client()
-        .get(format!("{}/metrics", app.admin_url))
+        .get(format!("{admin_url}/metrics"))
         .send()
         .expect("GET /metrics on the Admin Plane");
     assert_eq!(response.status().as_u16(), 200);
@@ -568,6 +624,18 @@ pub fn scrape_metrics(app: &TestApp) -> Vec<MetricSample> {
         "the exposition must be served as text/plain"
     );
     parse_metrics(&response.text().expect("read the exposition body"))
+}
+
+/// The `queue_items` gauge: records pending beyond the checkpoint.
+pub fn queue_items_at(admin_url: &str) -> Option<f64> {
+    metric_value(&scrape_metrics_at(admin_url), "queue_items", &[])
+}
+
+/// Blocks until the Admin Plane reports the wanted `Upstream Health` on the
+/// `upstream_healthy` gauge.
+pub fn wait_until_health(app: &TestApp, healthy: bool) {
+    let wanted = if healthy { 1.0 } else { 0.0 };
+    wait_until(|| metric_value(&scrape_metrics(app), "upstream_healthy", &[]) == Some(wanted));
 }
 
 /// Minimal YAML configuration for the given Upstream URL and ports.
@@ -605,6 +673,52 @@ pub fn config_yaml_for(
     queue_dir: &std::path::Path,
     extra_sections: &str,
 ) -> String {
+    config_yaml_full(
+        upstream_url,
+        data_plane_port,
+        admin_port,
+        queue_dir,
+        "",
+        extra_sections,
+    )
+}
+
+/// Full YAML configuration whose healthcheck flips `Upstream Health` within
+/// milliseconds, so tests can drive the delivery dispatcher through a health
+/// transition instead of waiting for the default 10s probe interval.
+pub fn config_yaml_with_fast_healthcheck(
+    upstream_url: &str,
+    data_plane_port: u16,
+    admin_port: u16,
+    extra_sections: &str,
+) -> String {
+    config_yaml_full(
+        upstream_url,
+        data_plane_port,
+        admin_port,
+        &tempdir(),
+        FAST_HEALTHCHECK,
+        extra_sections,
+    )
+}
+
+/// Healthcheck keys (indented under `upstream.healthcheck`) that make every
+/// probe result flip `Upstream Health` immediately.
+const FAST_HEALTHCHECK: &str = "\x20 \x20 interval: 50ms\n\
+                                \x20 \x20 timeout: 1s\n\
+                                \x20 \x20 unhealthy_threshold: 1\n\
+                                \x20 \x20 healthy_threshold: 1\n";
+
+/// Builds the full YAML configuration, appending `healthcheck_extra` keys
+/// under `upstream.healthcheck`.
+fn config_yaml_full(
+    upstream_url: &str,
+    data_plane_port: u16,
+    admin_port: u16,
+    queue_dir: &std::path::Path,
+    healthcheck_extra: &str,
+    extra_sections: &str,
+) -> String {
     format!(
         "server:\n\
          \x20 data_plane_addr: \"127.0.0.1:{data_plane_port}\"\n\
@@ -613,7 +727,7 @@ pub fn config_yaml_for(
          \x20 url: \"{upstream_url}\"\n\
          \x20 healthcheck:\n\
          \x20 \x20 path: \"{PROBE_PATH}\"\n\
-         queue:\n\
+         {healthcheck_extra}queue:\n\
          \x20 dir: \"{}\"\n{extra_sections}",
         queue_dir.display(),
     )

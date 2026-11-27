@@ -46,18 +46,12 @@ fn delivered_requests(upstream: &MockUpstream) -> usize {
 /// Polls the Admin Plane `GET /status` until it returns the wanted
 /// `Upstream Health` value, then returns the last status document.
 fn wait_for_health(app: &support::TestApp, health: &str) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = get_status(app);
-        if status["upstream"]["health"] == health {
-            return status;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "upstream health never became {health}: {status}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut last = get_status(app);
+    support::wait_until(|| {
+        last = get_status(app);
+        last["upstream"]["health"] == health
+    });
+    last
 }
 
 /// Fetches the Admin Plane `GET /status` document.
@@ -135,26 +129,20 @@ fn readyz_stays_200_and_traffic_buffers_while_unhealthy() {
         "the oldest buffered entry has an age: {status}"
     );
 
-    // Delivery workers pause: no further delivery attempts arrive.
-    let paused_count = {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let mut count = delivered_requests(&upstream);
-        while Instant::now() < deadline {
-            let latest = delivered_requests(&upstream);
-            if latest > count {
-                count = latest;
-            } else {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        count
-    };
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        delivered_requests(&upstream),
-        paused_count,
-        "no delivery attempts while Upstream Health is Unhealthy"
+    // Delivery workers pause: no further delivery attempts arrive. Wait for
+    // in-flight attempts to settle, then assert the pause over a quiet
+    // window (nothing happening has no positive observable state).
+    let mut paused_count = delivered_requests(&upstream);
+    support::wait_until_within(Duration::from_secs(1), || {
+        let latest = delivered_requests(&upstream);
+        let settled = latest == paused_count;
+        paused_count = latest;
+        settled
+    });
+    support::assert_no_change_for(
+        Duration::from_millis(300),
+        || delivered_requests(&upstream) == paused_count,
+        "no delivery attempts while Upstream Health is Unhealthy",
     );
 
     // Recovery: probes restore Healthy and the queue drains automatically.

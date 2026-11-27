@@ -6,7 +6,7 @@ mod support;
 
 use std::net::TcpStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use support::{
     MockUpstream, ServiceProcess, UpstreamResponse, config_yaml_for, ephemeral_port, http_client,
@@ -309,8 +309,12 @@ fn sighup_reloads_the_configuration() {
 
     // Let startup settle: without filesystem changes the watcher stays
     // silent, so the next reload is attributable to SIGHUP alone.
-    std::thread::sleep(Duration::from_millis(600));
     let baseline = reloads_count(&service.admin_url);
+    support::assert_no_change_for(
+        Duration::from_millis(600),
+        || reloads_count(&service.admin_url) == baseline,
+        "the config watcher must stay silent without filesystem changes",
+    );
 
     service.sighup();
     support::wait_until(|| reloads_count(&service.admin_url) == baseline + 1);
@@ -397,11 +401,7 @@ fn sigterm_shuts_down_gracefully_without_losing_accepted_payloads() {
 
     // While draining, /readyz must answer 503 (never 200); the window
     // closes when the process exits and connections are refused.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        if Instant::now() > deadline {
-            panic!("service did not exit within 15s of SIGTERM");
-        }
+    support::wait_until_within(Duration::from_secs(15), || {
         match http_client()
             .get(format!("{}/readyz", service.admin_url))
             .send()
@@ -409,11 +409,11 @@ fn sigterm_shuts_down_gracefully_without_losing_accepted_payloads() {
             Ok(response) => {
                 let status = response.status().as_u16();
                 assert_eq!(status, 503, "/readyz must drain with 503, got {status}");
+                false
             }
-            Err(_) => break,
+            Err(_) => true,
         }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    });
 
     // The process exits cleanly with code 0.
     let code = service.wait();
