@@ -1,4 +1,4 @@
-//! `sentry-ratelimiter`: an HTTP rate-limiting and buffering proxy that sits
+//! `vestibule`: an HTTP rate-limiting and buffering proxy that sits
 //! in front of a self-hosted Sentry `Upstream`.
 //!
 //! This crate is exposed as a library so integration tests can start the

@@ -5,20 +5,20 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use sentry_ratelimiter::app;
-use sentry_ratelimiter::config::load_config;
+use vestibule::app;
+use vestibule::config::load_config;
 
 /// Environment variable pointing to the YAML configuration file.
-const CONFIG_ENV_VAR: &str = "SENTRY_RATELIMITER_CONFIG";
+const CONFIG_ENV_VAR: &str = "VESTIBULE_CONFIG";
 
-const USAGE: &str = "usage: sentry-ratelimiter [--config <path>] (or set \
-                      SENTRY_RATELIMITER_CONFIG=<path>)";
+const USAGE: &str = "usage: vestibule [--config <path>] (or set \
+                      VESTIBULE_CONFIG=<path>)";
 
 fn main() -> ExitCode {
     match run() {
         Ok(never) => match never {},
         Err(error) => {
-            sentry_ratelimiter::log_error!("startup", "{error:#}");
+            vestibule::log_error!("startup", "{error:#}");
             ExitCode::FAILURE
         }
     }
@@ -31,7 +31,7 @@ fn run() -> anyhow::Result<Infallible> {
 }
 
 /// Resolves the configuration path from `--config <path>` (or `-c <path>`),
-/// falling back to `SENTRY_RATELIMITER_CONFIG`.
+/// falling back to `VESTIBULE_CONFIG`.
 fn resolve_config_path<I>(args: I) -> anyhow::Result<PathBuf>
 where
     I: Iterator<Item = std::ffi::OsString>,

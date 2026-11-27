@@ -1,12 +1,12 @@
-# Sample applications for sentry-ratelimiter
+# Sample applications for vestibule
 
-Three intentionally small applications used to exercise `sentry-ratelimiter`
+Three intentionally small applications used to exercise `vestibule`
 with different Sentry SDKs, languages, and HTTP frameworks, plus the rate
 limiter itself. Docker Compose starts four containers on one internal network:
 
 | Service              | Project | Purpose                                                         |
 | -------------------- | ------- | --------------------------------------------------------------- |
-| `sentry-ratelimiter` | -       | Production image built from the repository-root `Dockerfile`    |
+| `vestibule` | -       | Production image built from the repository-root `Dockerfile`    |
 | `fastapi`            | `1`     | Python 3.13 + FastAPI + `sentry-sdk[fastapi]` 2.23.1            |
 | `fastify`            | `2`     | Node.js 22 + Fastify 5 + `@sentry/node` 9.6.0                    |
 | `fiber`              | `3`     | Go 1.24 + Fiber 2 + `sentry-go` v0.31.0                          |
@@ -47,8 +47,8 @@ mise run sample-apps-down   # stop the stack
 
 Published ports by default:
 
-- `sentry-ratelimiter` Data Plane: <http://localhost:8080>
-- `sentry-ratelimiter` Admin Plane: <http://localhost:8081>
+- `vestibule` Data Plane: <http://localhost:8080>
+- `vestibule` Admin Plane: <http://localhost:8081>
 - FastAPI: <http://localhost:8001>
 - Fastify: <http://localhost:8002>
 - Fiber:   <http://localhost:8003>
@@ -138,7 +138,7 @@ FASTAPI_ENVIRONMENTS=production FASTIFY_ENVIRONMENTS=production \
 ```
 
 The default environment lists exercise all three runtime environments from
-[sentry-ratelimiter.yaml](./sentry-ratelimiter.yaml): `preprod` (event rate
+[vestibule.yaml](./vestibule.yaml): `preprod` (event rate
 10/s), `stage` (5/s), and `production` (1/s, tightened per project). With
 `TRAFFIC_COUNT=10` the production limits are hit almost immediately. Project
 `3` (fiber) overrides its `stage` limit (event rate 20/s), so fiber's stage
@@ -163,9 +163,9 @@ per-project rules and metric labels:
 
 | Service   | DSN inside the Compose network            | Project |
 | --------- | ----------------------------------------- | ------- |
-| `fastapi` | `http://public@sentry-ratelimiter:8080/1` | `1`     |
-| `fastify` | `http://public@sentry-ratelimiter:8080/2` | `2`     |
-| `fiber`   | `http://public@sentry-ratelimiter:8080/3` | `3`     |
+| `fastapi` | `http://public@vestibule:8080/1` | `1`     |
+| `fastify` | `http://public@vestibule:8080/2` | `2`     |
+| `fiber`   | `http://public@vestibule:8080/3` | `3`     |
 
 The project number (the last path segment) becomes the `project_id` used by the
 rate limiter's rules and metric labels. Override a single app's DSN only if you
@@ -182,17 +182,16 @@ You can also override:
 - `SENTRY_RELEASE` - default release name;
 - `LOG_LEVEL` - `trace`, `debug`, `info`, `warn`, or `error` (default `debug`);
 - `FASTAPI_PORT`, `FASTIFY_PORT`, `FIBER_PORT` - host-side app ports;
-- `RATELIMITER_DATA_PORT`, `RATELIMITER_ADMIN_PORT` - host-side rate limiter
-  ports.
+- `VESTIBULE_DATA_PORT`, `VESTIBULE_ADMIN_PORT` - host-side vestibule ports.
 
 Per-request `environment` query parameters override the SDK environment in the
 payload, which lets you exercise environment-scoped rate limit rules without
 restarting a container.
 
-## sentry-ratelimiter configuration
+## vestibule configuration
 
-The Compose stack mounts [sentry-ratelimiter.yaml](./sentry-ratelimiter.yaml)
-at `/etc/sentry-ratelimiter/config.yaml`. The file demonstrates every supported
+The Compose stack mounts [vestibule.yaml](./vestibule.yaml)
+at `/etc/vestibule/config.yaml`. The file demonstrates every supported
 section:
 
 - `server` - Data Plane/Admin Plane listeners and shutdown timeout;
@@ -207,7 +206,7 @@ section:
 - `observability` - log level and metric label allowlist.
 
 The Ingestion Queue is backed by the named volume
-`sentry-ratelimiter-queue` mounted at `/var/lib/sentry-ratelimiter/queue`, so
+`vestibule-queue` mounted at `/var/lib/vestibule/queue`, so
 buffered telemetry survives container recreation.
 
 Editing the mounted file on the host does not always reach the container's
@@ -215,7 +214,7 @@ file watcher (the Compose mount is a single-file bind mount), so restart the
 service after changing the rules:
 
 ```bash
-docker compose restart sentry-ratelimiter
+docker compose restart vestibule
 ```
 
 The rate limiter container has no Compose-level `healthcheck`: the distroless
@@ -230,7 +229,7 @@ http://upstream:9000
 
 Point it at your self-hosted Sentry/Relay on the same Compose network, or run a
 capture server with the network alias `upstream`. While the upstream is
-unavailable, `sentry-ratelimiter` still accepts SDK traffic and stores it in the
+unavailable, `vestibule` still accepts SDK traffic and stores it in the
 disk queue; `GET /status` shows the pending items and
 `GET /metrics` exposes the queue and upstream-health gauges.
 
@@ -239,7 +238,7 @@ disk queue; `GET /status` shows the pending items and
 All containers write JSON logs to stdout. Follow one service at a time:
 
 ```bash
-docker compose logs -f sentry-ratelimiter
+docker compose logs -f vestibule
 docker compose logs -f fastapi
 docker compose logs -f fastify
 docker compose logs -f fiber
@@ -263,7 +262,7 @@ Set `LOG_LEVEL=trace` for the extra per-item detail emitted at trace level.
 ```text
 sample-apps/
 ├── compose.yaml
-├── sentry-ratelimiter.yaml  # mounted into the rate limiter container
+├── vestibule.yaml           # mounted into the vestibule container
 ├── traffic.py               # uv traffic generator for the three apps
 ├── fastapi/                 # Python 3.13 + FastAPI + sentry-sdk 2.23.1
 ├── fastify/                 # Node.js 22 + Fastify 5 + @sentry/node 9.6.0
@@ -330,9 +329,9 @@ intentionally frozen to the Sentry 25.3.0 era):
 cd sample-apps
 docker compose build
 trivy image --scanners vuln --ignore-unfixed \
-  sentry-ratelimiter-sample-apps-fastapi:latest
+  vestibule-sample-apps-fastapi:latest
 trivy image --scanners vuln --ignore-unfixed \
-  sentry-ratelimiter-sample-apps-fastify:latest
+  vestibule-sample-apps-fastify:latest
 trivy image --scanners vuln --ignore-unfixed \
-  sentry-ratelimiter-sample-apps-fiber:latest
+  vestibule-sample-apps-fiber:latest
 ```

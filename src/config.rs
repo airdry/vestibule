@@ -896,7 +896,7 @@ mod tests {
              \x20 max_compressed_body_bytes: 1024\n\
              \x20 max_decompressed_body_bytes: 4096\n\
              queue:\n\
-             \x20 dir: \"/tmp/sentry-ratelimiter-wal\"\n\
+             \x20 dir: \"/tmp/vestibule-wal\"\n\
              \x20 max_bytes: 52428800\n\
              \x20 segment_size_bytes: 1048576\n\
              \x20 max_age: \"2h\"\n\
@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(config.ingest.success_status_code, 200);
         assert_eq!(config.ingest.max_compressed_body_bytes, 1024);
         assert_eq!(config.ingest.max_decompressed_body_bytes, 4096);
-        assert_eq!(config.queue.dir, Path::new("/tmp/sentry-ratelimiter-wal"));
+        assert_eq!(config.queue.dir, Path::new("/tmp/vestibule-wal"));
         assert_eq!(config.queue.max_bytes, 52_428_800);
         assert_eq!(config.queue.segment_size_bytes, 1_048_576);
         assert_eq!(config.queue.max_age, Duration::from_secs(2 * 60 * 60));

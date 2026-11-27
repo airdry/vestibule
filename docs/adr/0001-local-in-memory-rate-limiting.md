@@ -4,7 +4,7 @@ We keep all rate-limiting counters in local process memory rather than sharing s
 
 ## Context
 
-`sentry-ratelimiter` sits on the hot path of all Sentry SDK traffic and must add minimal latency while remaining deployable anywhere from `docker-compose` to Kubernetes without external infrastructure dependencies.
+`vestibule` sits on the hot path of all Sentry SDK traffic and must add minimal latency while remaining deployable anywhere from `docker-compose` to Kubernetes without external infrastructure dependencies.
 
 ## Decision
 

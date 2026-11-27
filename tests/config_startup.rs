@@ -1,5 +1,5 @@
 //! Startup contract tests for the binary: configuration is resolved from
-//! `--config` or `SENTRY_RATELIMITER_CONFIG`, validated on startup, and
+//! `--config` or `VESTIBULE_CONFIG`, validated on startup, and
 //! failures exit with a clear error message.
 
 mod support;
@@ -8,7 +8,7 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 
 /// Path to the built binary under test.
-const BINARY: &str = env!("CARGO_BIN_EXE_sentry-ratelimiter");
+const BINARY: &str = env!("CARGO_BIN_EXE_vestibule");
 
 struct BinaryOutput {
     status_code: Option<i32>,
@@ -35,7 +35,7 @@ fn run_binary(args: &[&str], env: Option<(&str, &str)>) -> BinaryOutput {
 }
 
 fn write_temp_config(content: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("sentry-ratelimiter-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("vestibule-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let path = dir.join(format!("config-{}.yaml", support::ephemeral_port()));
     std::fs::write(&path, content).expect("write temp config");
@@ -105,7 +105,7 @@ fn exits_with_error_when_no_config_given() {
         output.stderr
     );
     assert!(
-        output.stderr.contains("SENTRY_RATELIMITER_CONFIG"),
+        output.stderr.contains("VESTIBULE_CONFIG"),
         "stderr was: {}",
         output.stderr
     );
@@ -199,7 +199,7 @@ fn accepts_config_path_from_environment_variable() {
     let yaml = minimal_yaml();
     assert_binary_serves_probes(&yaml, |config_path| {
         Command::new(BINARY)
-            .env("SENTRY_RATELIMITER_CONFIG", config_path)
+            .env("VESTIBULE_CONFIG", config_path)
             .spawn()
             .expect("spawn binary")
     });

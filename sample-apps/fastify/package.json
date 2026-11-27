@@ -1,9 +1,9 @@
 {
-  "name": "sentry-ratelimiter-sample-fastify",
+  "name": "vestibule-sample-fastify",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Fastify sample application for exercising sentry-ratelimiter",
+  "description": "Fastify sample application for exercising vestibule",
   "scripts": {
     "start": "node src/server.js"
   },

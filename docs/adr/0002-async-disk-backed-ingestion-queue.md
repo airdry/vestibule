@@ -4,7 +4,7 @@ All Ingestion Route requests are accepted locally into a durable, disk-backed se
 
 ## Context
 
-`sentry-ratelimiter` must shield Sentry SDKs from latency spikes and outages in Upstream Sentry while supporting batched Envelope delivery and surviving pod restarts without losing buffered telemetry.
+`vestibule` must shield Sentry SDKs from latency spikes and outages in Upstream Sentry while supporting batched Envelope delivery and surviving pod restarts without losing buffered telemetry.
 
 ## Decision
 

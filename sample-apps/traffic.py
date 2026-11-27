@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["httpx>=0.28,<1"]
 # ///
-"""Continuous traffic generator for the sentry-ratelimiter sample stack.
+"""Continuous traffic generator for the vestibule sample stack.
 
 The script sends ``GET /events`` and ``GET /transactions`` requests to the
 FastAPI, Fastify, and Fiber sample applications, so the rate limiter can be

@@ -1,4 +1,4 @@
-// Fiber sample application used to exercise sentry-ratelimiter.
+// Fiber sample application used to exercise vestibule.
 //
 // It intentionally uses the Sentry Go SDK version that was current for Sentry
 // 25.3 (released 2025-03-17) and exposes two easy-to-call endpoints:
@@ -53,7 +53,7 @@ func main() {
 	initSentry(dsn, environment, release)
 
 	app := fiber.New(fiber.Config{
-		AppName:               "sentry-ratelimiter Fiber sample",
+		AppName:               "vestibule Fiber sample",
 		DisableStartupMessage: true,
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			logger.Error(

@@ -1,4 +1,4 @@
-module sentry-ratelimiter/sample-apps/fiber
+module vestibule/sample-apps/fiber
 
 go 1.24
 

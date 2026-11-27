@@ -1,4 +1,4 @@
-# Production image for sentry-ratelimiter.
+# Production image for vestibule.
 #
 # The builder stage installs every native build dependency (Pingora pulls in
 # aws-lc-rs and zlib-ng, both of which compile bundled C code through CMake).
@@ -38,29 +38,29 @@ COPY src ./src
 # dependency artifacts from the previous layer.
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release --locked --target x86_64-unknown-linux-musl \
-        --bin sentry-ratelimiter \
+        --bin vestibule \
     && strip --strip-all \
-        /build/target/x86_64-unknown-linux-musl/release/sentry-ratelimiter
+        /build/target/x86_64-unknown-linux-musl/release/vestibule
 
 # Create the default Ingestion Queue directory with nonroot ownership. The
 # application runs with this as its working directory, so the default
 # `queue.dir: queue` resolves to a writable path. The explicit queue/
 # subdirectory lets Compose initialize a named volume with nonroot ownership.
-RUN mkdir -p /out/var/lib/sentry-ratelimiter/queue \
-    && touch /out/var/lib/sentry-ratelimiter/.keep \
-    && touch /out/var/lib/sentry-ratelimiter/queue/.keep
+RUN mkdir -p /out/var/lib/vestibule/queue \
+    && touch /out/var/lib/vestibule/.keep \
+    && touch /out/var/lib/vestibule/queue/.keep
 
 FROM gcr.io/distroless/static-debian13:nonroot
 
 COPY --from=builder --chown=65532:65532 \
-    /build/target/x86_64-unknown-linux-musl/release/sentry-ratelimiter \
-    /usr/local/bin/sentry-ratelimiter
+    /build/target/x86_64-unknown-linux-musl/release/vestibule \
+    /usr/local/bin/vestibule
 COPY --from=builder --chown=65532:65532 \
-    /out/var/lib/sentry-ratelimiter \
-    /var/lib/sentry-ratelimiter
+    /out/var/lib/vestibule \
+    /var/lib/vestibule
 
 # The default queue directory and the working directory for relative paths.
-WORKDIR /var/lib/sentry-ratelimiter
+WORKDIR /var/lib/vestibule
 
 USER nonroot:nonroot
 
@@ -70,5 +70,5 @@ EXPOSE 8080 8081
 
 STOPSIGNAL SIGTERM
 
-ENTRYPOINT ["/usr/local/bin/sentry-ratelimiter"]
-CMD ["--config", "/etc/sentry-ratelimiter/config.yaml"]
+ENTRYPOINT ["/usr/local/bin/vestibule"]
+CMD ["--config", "/etc/vestibule/config.yaml"]

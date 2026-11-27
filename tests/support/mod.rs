@@ -327,18 +327,18 @@ pub fn start_service(yaml: &str) -> TestApp {
 /// planes accept connections.
 pub fn start_service_from_config(config_path: &std::path::Path) -> TestApp {
     let yaml = std::fs::read_to_string(config_path).expect("read test config");
-    let config = sentry_ratelimiter::config::Config::from_str(&yaml, "<test config>")
-        .expect("parse test config");
+    let config =
+        vestibule::config::Config::from_str(&yaml, "<test config>").expect("parse test config");
     let data_plane_addr = config.server.data_plane_addr;
     let admin_addr = config.server.admin_addr;
 
     let config_path = config_path.to_path_buf();
     let app_thread = thread::Builder::new()
-        .name("sentry-ratelimiter-under-test".to_string())
+        .name("vestibule-under-test".to_string())
         .spawn(move || {
             // Runs until the test process exits; errors would fail every test
             // through the readiness wait below.
-            let _run_result = sentry_ratelimiter::app::run(config, config_path);
+            let _run_result = vestibule::app::run(config, config_path);
         })
         .expect("spawn service thread");
 
@@ -380,9 +380,9 @@ impl ServiceProcess {
     /// Starts the built binary with the given config file and waits until
     /// both planes accept connections.
     pub fn start(config_path: &std::path::Path) -> Self {
-        let binary = env!("CARGO_BIN_EXE_sentry-ratelimiter");
+        let binary = env!("CARGO_BIN_EXE_vestibule");
         // Keep service logs for post-mortem debugging of crash tests.
-        let stderr_path = std::env::temp_dir().join("sentry-ratelimiter-service-stderr.log");
+        let stderr_path = std::env::temp_dir().join("vestibule-service-stderr.log");
         let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr log");
         let child = std::process::Command::new(binary)
             .arg("--config")

@@ -1,7 +1,7 @@
-# sentry-ratelimiter configuration for the sample stack.
+# vestibule configuration for the sample stack.
 #
 # The Compose file mounts this file at
-# /etc/sentry-ratelimiter/config.yaml inside the container. The disk Ingestion
+# /etc/vestibule/config.yaml inside the container. The disk Ingestion
 # Queue lives on the named volume mounted at queue.dir.
 
 server:
@@ -13,7 +13,7 @@ upstream:
   # The sample stack does not run Sentry itself. Point this at your
   # self-hosted Sentry/Relay on the same Compose network, or run a capture
   # server with the network alias "upstream". While it is unavailable,
-  # sentry-ratelimiter still accepts telemetry into the durable queue.
+  # vestibule still accepts telemetry into the durable queue.
   url: "http://upstream:9000"
   timeout: "10s"
   healthcheck:
@@ -31,7 +31,7 @@ ingest:
   max_decompressed_body_bytes: 52428800
 
 queue:
-  dir: "/var/lib/sentry-ratelimiter/queue"
+  dir: "/var/lib/vestibule/queue"
   max_bytes: 1073741824
   segment_size_bytes: 16777216
   max_age: "24h"

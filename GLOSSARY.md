@@ -1,6 +1,8 @@
-# sentry-ratelimiter
+# vestibule
 
 An HTTP rate-limiting and buffering proxy that sits in front of a self-hosted Sentry installation to protect Sentry's processing pipeline from SDK traffic spikes.
+
+The name is the metaphor: a vestibule is the small chamber between the street and the building's interior, where visitors wait until they are let in. `vestibule` is that chamber for Sentry SDK traffic — it absorbs the surge, holds telemetry in the Ingestion Queue, and admits it to Upstream at a controlled rate.
 
 ## Language
 

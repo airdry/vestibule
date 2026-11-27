@@ -1,4 +1,4 @@
-"""FastAPI sample application used to exercise sentry-ratelimiter.
+"""FastAPI sample application used to exercise vestibule.
 
 The application intentionally uses the Sentry Python SDK version released for
 Sentry 25.3 (2025-03-17) and exposes two easy-to-call endpoints:
@@ -71,7 +71,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     logger.info("app.stopping", extra={"sentry_flushed": flushed})
 
 
-app = FastAPI(title="sentry-ratelimiter FastAPI sample", lifespan=lifespan)
+app = FastAPI(title="vestibule FastAPI sample", lifespan=lifespan)
 
 
 @app.middleware("http")
