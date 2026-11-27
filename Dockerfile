@@ -44,9 +44,11 @@ RUN touch src/main.rs src/lib.rs \
 
 # Create the default Ingestion Queue directory with nonroot ownership. The
 # application runs with this as its working directory, so the default
-# `queue.dir: queue` resolves to a writable path.
-RUN mkdir -p /out/var/lib/sentry-ratelimiter \
-    && touch /out/var/lib/sentry-ratelimiter/.keep
+# `queue.dir: queue` resolves to a writable path. The explicit queue/
+# subdirectory lets Compose initialize a named volume with nonroot ownership.
+RUN mkdir -p /out/var/lib/sentry-ratelimiter/queue \
+    && touch /out/var/lib/sentry-ratelimiter/.keep \
+    && touch /out/var/lib/sentry-ratelimiter/queue/.keep
 
 FROM gcr.io/distroless/static-debian13:nonroot
 

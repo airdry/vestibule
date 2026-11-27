@@ -1,0 +1,78 @@
+# sentry-ratelimiter configuration for the sample stack.
+#
+# The Compose file mounts this file at
+# /etc/sentry-ratelimiter/config.yaml inside the container. The disk Ingestion
+# Queue lives on the named volume mounted at queue.dir.
+
+server:
+  data_plane_addr: "0.0.0.0:8080"
+  admin_addr: "0.0.0.0:8081"
+  shutdown_timeout: "30s"
+
+upstream:
+  # The sample stack does not run Sentry itself. Point this at your
+  # self-hosted Sentry/Relay on the same Compose network, or run a capture
+  # server with the network alias "upstream". While it is unavailable,
+  # sentry-ratelimiter still accepts telemetry into the durable queue.
+  url: "http://upstream:9000"
+  timeout: "10s"
+  healthcheck:
+    path: "/"
+    expected_statuses:
+      - 200
+    interval: "5s"
+    timeout: "2s"
+    unhealthy_threshold: 3
+    healthy_threshold: 2
+
+ingest:
+  success_status_code: 201
+  max_compressed_body_bytes: 10485760
+  max_decompressed_body_bytes: 52428800
+
+queue:
+  dir: "/var/lib/sentry-ratelimiter/queue"
+  max_bytes: 1073741824
+  segment_size_bytes: 16777216
+  max_age: "24h"
+  overflow_policy: drop_oldest
+  fsync_mode: periodic
+  fsync_interval: "200ms"
+
+batch:
+  max_items: 100
+  max_bytes: 10485760
+  flush_interval: "100ms"
+  workers: 4
+  max_requests_per_sec: 100
+
+rate_limits:
+  max_buckets: 10000
+  bucket_ttl: "10m"
+  defaults:
+    event:
+      rate: 5
+      burst: 10
+    transaction:
+      rate: 2
+      burst: 5
+    other:
+      rate: 10
+      burst: 20
+  projects:
+    1:
+      environments:
+        production:
+          event:
+            rate: 1
+            burst: 2
+          transaction:
+            rate: 1
+            burst: 2
+
+observability:
+  log_level: "debug"
+  environment_label_allowlist:
+    - sample-apps
+    - production
+    - staging
