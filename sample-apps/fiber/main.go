@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -40,6 +41,10 @@ const (
 var logger = newJSONLogger()
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-healthcheck" {
+		os.Exit(healthcheck())
+	}
+
 	dsn := envOrDefault("SENTRY_DSN", defaultDSN)
 	environment := envOrDefault("SENTRY_ENVIRONMENT", defaultEnvironment)
 	release := envOrDefault("SENTRY_RELEASE", defaultRelease)
@@ -211,6 +216,25 @@ func main() {
 
 	flushed := sentry.Flush(5 * time.Second)
 	logger.Info("app.stopped", "sentry_flushed", flushed)
+}
+
+// healthcheck probes the local /health endpoint and returns a process exit
+// code. The distroless runtime image has no shell or HTTP client, so the
+// container HEALTHCHECK invokes the binary itself with -healthcheck.
+func healthcheck() int {
+	client := http.Client{Timeout: 2 * time.Second}
+	response, err := client.Get(
+		"http://127.0.0.1:" + envOrDefault("PORT", "8080") + "/health",
+	)
+	if err != nil {
+		return 1
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if response.StatusCode != http.StatusOK {
+		return 1
+	}
+	return 0
 }
 
 func newJSONLogger() *slog.Logger {

@@ -7,7 +7,7 @@ limiter itself. Docker Compose starts four containers on one internal network:
 | Service              | Purpose                                                         |
 | -------------------- | --------------------------------------------------------------- |
 | `sentry-ratelimiter` | Production image built from the repository-root `Dockerfile`    |
-| `fastapi`            | Python 3.12 + FastAPI + `sentry-sdk[fastapi]` 2.23.1            |
+| `fastapi`            | Python 3.13 + FastAPI + `sentry-sdk[fastapi]` 2.23.1            |
 | `fastify`            | Node.js 22 + Fastify 5 + `@sentry/node` 9.6.0                    |
 | `fiber`              | Go 1.24 + Fiber 2 + `sentry-go` v0.31.0                          |
 
@@ -168,7 +168,7 @@ Set `LOG_LEVEL=trace` for the extra per-item detail emitted at trace level.
 sample-apps/
 ├── compose.yaml
 ├── sentry-ratelimiter.yaml  # mounted into the rate limiter container
-├── fastapi/                 # Python 3.12 + FastAPI + sentry-sdk 2.23.1
+├── fastapi/                 # Python 3.13 + FastAPI + sentry-sdk 2.23.1
 ├── fastify/                 # Node.js 22 + Fastify 5 + @sentry/node 9.6.0
 └── fiber/                   # Go 1.24 + Fiber 2 + sentry-go v0.31.0
 ```
@@ -181,3 +181,61 @@ endpoint used by its container health check.
 The FastAPI app is served with `uvicorn` directly instead of the `fastapi` CLI:
 the CLI does not expose uvicorn's `log_config`, which is needed to keep uvicorn
 and Sentry SDK output on the same JSON formatter.
+
+## Container images
+
+Every sample app uses a distroless runtime image, so the shipped image contains
+only the language runtime, glibc, CA certificates, and the application itself:
+no shell, package manager, `curl`, or `wget`.
+
+| Service   | Runtime image                                  | Build stage                    |
+| --------- | ---------------------------------------------- | ------------------------------ |
+| `fastapi` | `gcr.io/distroless/python3-debian13:nonroot`   | `python:3.13-slim-trixie`       |
+| `fastify` | `gcr.io/distroless/nodejs22-debian13:nonroot`  | `node:22.23.5-bookworm-slim`    |
+| `fiber`   | `gcr.io/distroless/static-debian13:nonroot`    | `golang:1.24.1-bookworm`        |
+
+Because there is no shell, the `HEALTHCHECK` instructions invoke the runtime
+that is already in the image instead of `curl`/`wget`:
+
+- `fastapi` runs `/usr/bin/python3 -c ...` against `http://127.0.0.1:8000/health`;
+- `fastify` runs `/nodejs/bin/node -e ...` against `http://127.0.0.1:3000/health`;
+- `fiber` runs its own binary with `-healthcheck`, which probes
+  `http://127.0.0.1:8080/health`.
+
+All images run as the distroless `nonroot` user (UID/GID `65532`) and work with
+the Compose hardening (`read_only`, `cap_drop: ALL`, `no-new-privileges`).
+
+Supported platforms follow the upstream distroless images:
+
+- `static-debian13` and `base-debian13`: `amd64`, `arm64`, `arm`, `s390x`,
+  `ppc64le`, `riscv64`;
+- `nodejs22-debian13`: `amd64`, `arm64`, `arm`, `s390x`, `ppc64le`;
+- `python3-debian13`: `amd64`, `arm64`, `riscv64`.
+
+### Debugging a distroless container
+
+There is no shell to `docker compose exec` into. Rebuild the affected service
+with the `debug` variant of the same image (it adds BusyBox) when you need to
+inspect the filesystem:
+
+```bash
+docker build --build-arg RUNTIME_IMAGE=gcr.io/distroless/python3-debian13:debug-nonroot \
+  -t fastapi-debug ./fastapi
+```
+
+### Vulnerability scanning
+
+The distroless base images carry no fixable OS packages, so Trivy reports only
+the pinned application dependencies (the SDK and framework versions are
+intentionally frozen to the Sentry 25.3.0 era):
+
+```bash
+cd sample-apps
+docker compose build
+trivy image --scanners vuln --ignore-unfixed \
+  sentry-ratelimiter-sample-apps-fastapi:latest
+trivy image --scanners vuln --ignore-unfixed \
+  sentry-ratelimiter-sample-apps-fastify:latest
+trivy image --scanners vuln --ignore-unfixed \
+  sentry-ratelimiter-sample-apps-fiber:latest
+```
