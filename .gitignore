@@ -1,6 +1,9 @@
 # Local issue tracker & scratch artifacts (kept local, never committed)
 .scratch/
 
+# Agent instructions (kept local, never committed)
+AGENTS.md
+
 # Rust build artifacts
 /target/
 **/*.rs.bk
