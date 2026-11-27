@@ -69,25 +69,13 @@ fn ingest_envelope(app: &support::TestApp, message: &str, key: &str) {
     assert_eq!(response.status().as_u16(), 201);
 }
 
-/// Polls until `condition` holds or a 10s deadline passes.
-fn wait_until<F: Fn() -> bool>(condition: F) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if condition() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!("condition was not met within 10 seconds");
-}
-
 #[test]
 fn queued_payload_is_delivered_to_upstream_with_metadata() {
     let (app, upstream) = start_delivery(vec![UpstreamResponse::ok("stored")]);
 
     ingest(&app, r#"{"event_id":"aaa"}"#);
 
-    wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    support::wait_until(|| !support::non_probe_requests(&upstream).is_empty());
     let forwarded = &support::non_probe_requests(&upstream)[0];
     assert_eq!(forwarded.method, "POST");
     assert_eq!(forwarded.path, "/api/42/envelope/?sentry_key=abc123");
@@ -109,7 +97,7 @@ fn upstream_500_is_retried_with_backoff_until_success() {
 
     ingest(&app, "payload");
 
-    wait_until(|| support::non_probe_requests(&upstream).len() >= 3);
+    support::wait_until(|| support::non_probe_requests(&upstream).len() >= 3);
     let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
@@ -127,7 +115,7 @@ fn throttled_429_pauses_the_worker_for_retry_after() {
 
     ingest(&app, "payload");
 
-    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    support::wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
     let requests = support::non_probe_requests(&upstream);
     assert_eq!(requests.len(), 2);
     let retry_gap = requests[1]
@@ -149,7 +137,7 @@ fn unrecoverable_4xx_drops_the_record_and_does_not_block_the_queue() {
     ingest(&app, "bad payload");
     ingest(&app, "good payload");
 
-    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    support::wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
     let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
@@ -198,15 +186,20 @@ fn upstream_timeout_is_retried_and_delivered_on_the_next_attempt() {
 
     ingest(&app, "payload");
 
-    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    support::wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
     let requests = support::non_probe_requests(&upstream);
     assert!(requests.iter().any(|r| r.body == b"payload".to_vec()));
 }
 
 #[test]
 fn compatible_envelopes_are_merged_into_one_gzip_request() {
-    let upstream = MockUpstream::start(UpstreamResponse::ok("ignored"));
-    let config = support::config_yaml_with(
+    // The Upstream fails, so Upstream Health turns Unhealthy and the
+    // dispatcher buffers both records instead of claiming them. Flipping the
+    // Upstream back to 200 makes the health transition claim both records in
+    // one pass, so the merge no longer depends on where the second post lands
+    // relative to a flush tick.
+    let upstream = MockUpstream::start(UpstreamResponse::with_status(503));
+    let config = support::config_yaml_with_fast_healthcheck(
         &upstream.url(),
         support::ephemeral_port(),
         support::ephemeral_port(),
@@ -214,12 +207,16 @@ fn compatible_envelopes_are_merged_into_one_gzip_request() {
     );
     let app = support::start_service(&config);
 
+    support::wait_until_health(&app, false);
+
     ingest_envelope(&app, "first", "abc123");
     ingest_envelope(&app, "second", "abc123");
 
-    wait_until(|| !support::non_probe_requests(&upstream).is_empty());
-    // Give the second record a chance to join the same batch.
-    std::thread::sleep(Duration::from_millis(300));
+    upstream.set_response(UpstreamResponse::ok("stored"));
+
+    // A drained queue means both records were delivered and committed, so a
+    // regression that seals them separately is visible as two requests.
+    support::wait_until(|| support::queue_items_at(&app.admin_url) == Some(0.0));
     let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
@@ -258,7 +255,7 @@ fn different_sentry_keys_are_never_merged() {
     ingest_envelope(&app, "first", "abc123");
     ingest_envelope(&app, "second", "def456");
 
-    wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
+    support::wait_until(|| support::non_probe_requests(&upstream).len() >= 2);
     let requests = support::non_probe_requests(&upstream);
     assert_eq!(
         requests.len(),
@@ -288,7 +285,7 @@ fn a_single_envelope_record_is_flushed_after_flush_interval() {
 
     ingest_envelope(&app, "single", "abc123");
 
-    wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    support::wait_until(|| !support::non_probe_requests(&upstream).is_empty());
     let requests = support::non_probe_requests(&upstream);
     assert_eq!(requests.len(), 1, "exactly one flush must happen");
     let request = &requests[0];
