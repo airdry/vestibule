@@ -3,7 +3,11 @@
 
 [tools]
 # Pingora MSRV is 1.85 (rolling 6-month policy); pin latest stable.
-rust = "1.100.0"
+# The profile and components are pinned because mise installs the toolchain with
+# rustup's configured profile: GitHub runners bootstrap rustup with
+# `--profile=minimal`, so without this the gates fail with "'cargo-fmt' is not
+# installed for the toolchain" (and clippy would fail the same way).
+rust = { version = "1.100.0", profile = "minimal", components = ["rustfmt", "clippy"] }
 # Quality gates from AGENTS.md (mokevnin/dev-quality-gates#rust).
 cargo-deny = "0.22.0"
 # Use the prebuilt release binary: the `cargo:` backend compiles the crate and
