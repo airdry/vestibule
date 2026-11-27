@@ -36,3 +36,23 @@ run = "cargo test --all"
 [tasks.gates]
 description = "Run every quality gate (fmt-check, lint, machete, deny, test)"
 depends = ["fmt-check", "lint", "machete", "deny", "test"]
+
+[tasks.sample-apps]
+description = "Build and start the sample applications with Docker Compose"
+dir = "sample-apps"
+run = "docker compose up -d --build"
+
+[tasks.sample-apps-build]
+description = "Build the sample application images with Docker Compose"
+dir = "sample-apps"
+run = "docker compose build"
+
+[tasks.sample-apps-logs]
+description = "Follow the sample application logs"
+dir = "sample-apps"
+run = "docker compose logs -f"
+
+[tasks.sample-apps-down]
+description = "Stop the sample applications"
+dir = "sample-apps"
+run = "docker compose down"

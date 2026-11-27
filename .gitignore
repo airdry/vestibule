@@ -4,3 +4,10 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+
+# Sample application local artifacts
+sample-apps/*/node_modules/
+sample-apps/fastapi/**/__pycache__/
+sample-apps/fastapi/**/*.pyc
+sample-apps/fiber/fiber-app
+sample-apps/fiber/fiber

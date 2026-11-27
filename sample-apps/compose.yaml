@@ -1,0 +1,42 @@
+name: sentry-ratelimiter-sample-apps
+
+x-sample-app: &sample-app
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 15s
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+  tmpfs:
+    - /tmp
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  environment:
+    SENTRY_DSN: ${SENTRY_DSN:-http://public@host.docker.internal:8080/1}
+    SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-sample-apps}
+    SENTRY_RELEASE: ${SENTRY_RELEASE:-sample-apps@local}
+    LOG_LEVEL: ${LOG_LEVEL:-debug}
+
+services:
+  fastapi:
+    <<: *sample-app
+    build:
+      context: ./fastapi
+    ports:
+      - "${FASTAPI_PORT:-8001}:8000"
+
+  fastify:
+    <<: *sample-app
+    build:
+      context: ./fastify
+    ports:
+      - "${FASTIFY_PORT:-8002}:3000"
+
+  fiber:
+    <<: *sample-app
+    build:
+      context: ./fiber
+    ports:
+      - "${FIBER_PORT:-8003}:8080"
