@@ -1,0 +1,19 @@
+# Build context for the production image. Tests are intentionally excluded.
+.git/
+.github/
+.scratch/
+target/
+**/*.rs.bk
+sample-apps/
+tests/
+docs/
+*.md
+AGENTS.md
+GLOSSARY.md
+deny.toml
+mise.toml
+Dockerfile
+.dockerignore
+.env
+.env.*
+.DS_Store
