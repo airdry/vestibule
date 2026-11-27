@@ -1,0 +1,67 @@
+name: CI
+
+# Every pull request against main runs the quality gates and, once they pass,
+# the production image build. Nothing is published here: pull requests only
+# prove that the image still builds, and the resulting tarball is uploaded as a
+# downloadable workflow artifact.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: Quality gates
+    uses: ./.github/workflows/quality-gates.yml
+
+  image:
+    name: Build image (no publish)
+    needs: gates
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # The image is built exactly the way the release workflow builds it, but
+      # it is loaded into a tarball instead of being pushed to a registry.
+      - name: Build production image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          tags: vestibule:${{ github.sha }}
+          outputs: type=docker,dest=${{ runner.temp }}/vestibule-image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report image size
+        run: |
+          ls -lh "$RUNNER_TEMP/vestibule-image.tar"
+          echo "### Image built (not published)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ls -lh "$RUNNER_TEMP/vestibule-image.tar" | awk '{print $5, $9}' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vestibule-image-sha-${{ github.sha }}
+          path: ${{ runner.temp }}/vestibule-image.tar
+          if-no-files-found: error
+          retention-days: 7

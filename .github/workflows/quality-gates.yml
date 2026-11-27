@@ -1,0 +1,50 @@
+name: Quality gates
+
+# The five Rust quality gates from AGENTS.md (mokevnin/dev-quality-gates#rust),
+# executed through the very `mise.toml` tasks developers run locally. Keeping a
+# single source of truth for tool versions and commands means CI cannot drift
+# from `mise run gates`.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: mise quality gates
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Installs Rust 1.100.0, cargo-deny 0.22.0, cargo-machete 0.10.1 and cmake
+      # at the versions pinned in mise.toml.
+      - name: Install pinned toolchain
+        uses: jdx/mise-action@v5
+
+      # The registry and target/ directory are the expensive part: clippy and
+      # the test suite share one compilation profile inside this job.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gates
+
+      # Cheap, compile-free checks first so a formatting or dependency mistake
+      # fails the run before the toolchain spends minutes building.
+      - name: rustfmt
+        run: mise run fmt-check
+
+      - name: cargo-machete (unused dependencies)
+        run: mise run machete
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        run: mise run deny
+
+      - name: clippy (warnings denied)
+        run: mise run lint
+
+      - name: cargo test
+        run: mise run test
