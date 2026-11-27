@@ -1,7 +1,5 @@
 mod support;
 
-use std::time::Duration;
-
 use support::{MockUpstream, UpstreamResponse, http_client};
 
 /// Starts the service with the given `rate_limits` YAML section and a mock
@@ -183,18 +181,22 @@ fn bucket_refills_over_time() {
     let throttled = post_body(&app, "/api/7/store/", body.clone());
     assert_eq!(throttled.status().as_u16(), 429);
 
-    // At 0.5 RPS one token refills after 2s; allow generous slack.
-    std::thread::sleep(Duration::from_millis(3500));
-    assert_eq!(
-        post_body(&app, "/api/7/store/", body).status().as_u16(),
-        201
-    );
+    // At 0.5 RPS one token refills after 2s: poll until the bucket allows
+    // again instead of sleeping for a guessed duration.
+    support::wait_until(|| {
+        post_body(&app, "/api/7/store/", body.clone())
+            .status()
+            .as_u16()
+            == 201
+    });
 }
 
 #[test]
 fn high_cardinality_environments_cannot_oom_the_bucket_table() {
+    // A one-bucket table makes eviction deterministic: every new environment
+    // evicts the previous one, so the table never grows past its bound.
     let (app, _upstream) = start_with_rate_limits(
-        "  max_buckets: 2\n\
+        "  max_buckets: 1\n\
          \x20 bucket_ttl: 10m\n\
          \x20 defaults:\n\
          \x20 \x20 event: {rate: 1, burst: 1}\n",
@@ -209,9 +211,9 @@ fn high_cardinality_environments_cannot_oom_the_bucket_table() {
         );
     }
 
-    // The first environment's bucket was evicted (LRU); its next request
-    // starts with a fresh full bucket instead of the throttled state it
-    // would have kept if the table were unbounded.
+    // The previous environment's bucket was evicted; its next request starts
+    // with a fresh full bucket instead of the throttled state it would have
+    // kept if the table were unbounded.
     let body = br#"{"environment":"one"}"#.to_vec();
     assert_eq!(
         post_body(&app, "/api/42/store/", body).status().as_u16(),

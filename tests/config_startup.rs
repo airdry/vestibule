@@ -70,14 +70,11 @@ fn assert_binary_serves_probes(
     let mut child = spawn(&config_path);
 
     let admin_port = admin_port_of(yaml);
-    support::wait_until_listening(
-        format!("127.0.0.1:{admin_port}")
-            .parse()
-            .expect("valid addr"),
-    );
+    let admin_url = format!("http://127.0.0.1:{admin_port}");
+    support::wait_until_ready(&admin_url);
 
     let response = support::http_client()
-        .get(format!("http://127.0.0.1:{admin_port}/healthz"))
+        .get(format!("{admin_url}/healthz"))
         .send()
         .expect("GET /healthz from the started binary");
     assert_eq!(response.status().as_u16(), 200);

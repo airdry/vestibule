@@ -3,7 +3,11 @@
 
 [tools]
 # Pingora MSRV is 1.85 (rolling 6-month policy); pin latest stable.
-rust = "1.100.0"
+# The profile and components are pinned because mise installs the toolchain with
+# rustup's configured profile: GitHub runners bootstrap rustup with
+# `--profile=minimal`, so without this the gates fail with "'cargo-fmt' is not
+# installed for the toolchain" (and clippy would fail the same way).
+rust = { version = "1.100.0", profile = "minimal", components = ["rustfmt", "clippy"] }
 # Quality gates from AGENTS.md (mokevnin/dev-quality-gates#rust).
 cargo-deny = "0.22.0"
 # Use the prebuilt release binary: the `cargo:` backend compiles the crate and
@@ -38,9 +42,31 @@ run = "cargo deny check"
 description = "Run all tests"
 run = "cargo test --all"
 
+[tasks.lint-test]
+description = "clippy and tests in one compilation pass (quality gate)"
+# `cargo clippy` only checks (rmeta), so a following `cargo test` rebuilds every
+# dependency for codegen: the two gates compile the same crates twice. Using
+# clippy-driver as the workspace rustc wrapper lints this crate while it is
+# built for the tests, so dependencies are compiled once. Dependencies are still
+# built by plain rustc, so `-D warnings` applies to this crate only.
+run = "RUSTC_WORKSPACE_WRAPPER=clippy-driver CLIPPY_ARGS=-Dwarnings cargo test --all"
+
 [tasks.gates]
-description = "Run every quality gate (fmt-check, lint, machete, deny, test)"
-depends = ["fmt-check", "lint", "machete", "deny", "test"]
+description = "Run every quality gate in CI order (fmt-check, machete, deny, lint-test)"
+# An ordered `run` array instead of `depends`: `depends` entries run in parallel
+# (up to `jobs`), which makes clippy and the test suite contend for the same
+# cargo `target/` lock and hides which gate failed first. The array runs the
+# gates one at a time and stops at the first failure, matching the order the CI
+# workflow uses: compile-free checks before the expensive build.
+#
+# `lint-test` covers both the clippy and the test gate in a single compilation
+# pass; `lint` and `test` stay available for running either one on its own.
+run = [
+  { task = "fmt-check" },
+  { task = "machete" },
+  { task = "deny" },
+  { task = "lint-test" },
+]
 
 [tasks.sample-apps]
 description = "Build and start the sample applications with Docker Compose"

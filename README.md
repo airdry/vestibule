@@ -81,6 +81,7 @@ Detailed documentation — every configuration key, rate-limit resolution rules,
 
 - [`GLOSSARY.md`](GLOSSARY.md) — the domain language used across the codebase and docs;
 - [`docs/adr/`](docs/adr/) — architectural decisions (in-memory rate limiting, disk-backed queue, readiness independent of upstream health);
+- [`docs/release.md`](docs/release.md) — the GitHub Actions quality gates, image build and the approval-gated `ghcr.io` release process;
 - [`sample-apps/vestibule.yaml`](sample-apps/vestibule.yaml) — the reference configuration.
 
 ## License

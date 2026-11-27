@@ -18,9 +18,15 @@ fn start_with(extra_sections: &str) -> (support::TestApp, MockUpstream) {
     (support::start_service(&config), upstream)
 }
 
-/// Builds a config with extra `queue` keys (indented under the `queue`
-/// section) plus extra sections appended after it.
-fn queue_config(upstream_url: &str, queue_keys: &str, extra_sections: &str) -> String {
+/// Builds a config with extra `upstream.healthcheck` keys, extra `queue`
+/// keys (indented under the `queue` section) plus extra sections appended
+/// after it.
+fn queue_config(
+    upstream_url: &str,
+    healthcheck_keys: &str,
+    queue_keys: &str,
+    extra_sections: &str,
+) -> String {
     format!(
         "server:\n\
          \x20 data_plane_addr: \"127.0.0.1:{}\"\n\
@@ -29,7 +35,7 @@ fn queue_config(upstream_url: &str, queue_keys: &str, extra_sections: &str) -> S
          \x20 url: \"{upstream_url}\"\n\
          \x20 healthcheck:\n\
          \x20 \x20 path: \"{}\"\n\
-         queue:\n\
+         {healthcheck_keys}queue:\n\
          \x20 dir: \"{}\"\n\
          {queue_keys}{extra_sections}",
         support::ephemeral_port(),
@@ -310,7 +316,7 @@ fn buckets_ingest_items_by_environment_allowlist() {
 
 #[test]
 fn counts_upstream_delivery_and_batch_items() {
-    let (app, upstream) = start_with("batch:\n  flush_interval: 50ms\n");
+    let (app, _upstream) = start_with("batch:\n  flush_interval: 50ms\n");
 
     assert_eq!(
         post_ingest(&app, "/api/42/envelope/", envelope("prod"))
@@ -318,7 +324,15 @@ fn counts_upstream_delivery_and_batch_items() {
             .as_u16(),
         201
     );
-    support::wait_until(|| !support::non_probe_requests(&upstream).is_empty());
+    // The delivery metrics are recorded after the response arrives, so wait
+    // on the metric itself instead of on the recorded request.
+    support::wait_until(|| {
+        metric_value(
+            &scrape_metrics(&app),
+            "upstream_requests_total",
+            &[("outcome", "success")],
+        ) == Some(1.0)
+    });
 
     let samples = scrape_metrics(&app);
     assert_eq!(
@@ -369,15 +383,21 @@ fn reports_queue_saturation_gauges_while_batches_wait() {
 
 #[test]
 fn counts_ttl_expired_drops() {
-    let upstream = MockUpstream::start(UpstreamResponse::ok("upstream body"));
-    // The record expires before the delivery dispatcher ever claims it:
-    // the flush tick at 2s finds a record older than the 1s TTL.
+    // The Upstream fails, so Upstream Health turns Unhealthy and the
+    // dispatcher buffers the record instead of claiming it. Waiting for the
+    // record to age past `max_age` on the queue gauge guarantees it is
+    // expired when the health transition claims it, instead of depending on
+    // whether the dispatcher's first tick runs before or after the ingest.
+    let upstream = MockUpstream::start(UpstreamResponse::with_status(503));
     let config = queue_config(
         &upstream.url(),
+        "    interval: 50ms\n    timeout: 1s\n    unhealthy_threshold: 1\n    healthy_threshold: 1\n",
         "  max_age: 1s\n",
         "batch:\n  flush_interval: 2s\n",
     );
     let app = support::start_service(&config);
+
+    support::wait_until_health(&app, false);
 
     assert_eq!(
         post_ingest(&app, "/api/42/envelope/", envelope("prod"))
@@ -385,6 +405,13 @@ fn counts_ttl_expired_drops() {
             .as_u16(),
         201
     );
+
+    // `max_age` is 1s and the TTL check is strict, so wait for a margin.
+    support::wait_until(|| {
+        metric_value(&scrape_metrics(&app), "queue_oldest_age_seconds", &[]) >= Some(1.1)
+    });
+
+    upstream.set_response(UpstreamResponse::ok("upstream body"));
 
     support::wait_until(|| {
         metric_value(
@@ -403,6 +430,7 @@ fn counts_overflow_evicted_drops() {
     // append.
     let config = queue_config(
         &upstream.url(),
+        "",
         "  max_bytes: 1\n  segment_size_bytes: 1\n",
         "batch:\n  flush_interval: 60s\n",
     );

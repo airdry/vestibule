@@ -1,0 +1,9 @@
+# actionlint configuration.
+#
+# `ubuntu-26.04` is a GA GitHub-hosted label (see actions/runner-images, where it
+# is also `ubuntu-latest`), but actionlint's embedded label list lags behind the
+# published runner images. Declaring it here silences that false positive without
+# disabling any other check.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
