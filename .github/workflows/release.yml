@@ -84,9 +84,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # A 0.x release is not a stable line: it gets its own version and minor
-      # tags plus the commit tag, but no major tag and no `latest` — a pre-1.0
-      # build must never become what `:latest` resolves to.
+      # Every release is addressed by an explicit version, a moving minor or
+      # major tag, or its commit. There is no `latest`: consumers pin a release
+      # line instead of silently following whatever was published last. A 0.x
+      # release additionally gets no major tag, because it makes no stability
+      # promise.
       - name: Compute image tags
         id: meta
         run: |
@@ -98,7 +100,7 @@ jobs:
 
           tags=("$image:$version" "$image:${version%.*}")
           if [ "${version%%.*}" != "0" ]; then
-            tags+=("$image:${version%%.*}" "$image:latest")
+            tags+=("$image:${version%%.*}")
           fi
           tags+=("$image:sha-$short_sha")
 

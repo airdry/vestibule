@@ -73,14 +73,18 @@ verification and approval.
 
 ### Image tags
 
+There is no `latest` tag. Every release is addressable explicitly: by its
+version, by a moving minor or major tag, or by its commit. A consumer therefore
+pins the line it depends on instead of silently following whatever was published
+last.
+
 For `version = "1.0.0"` the published tags are:
 
 | Tag | Meaning |
 | --- | --- |
 | `1.0.0` | immutable release |
-| `1.0` | latest patch of the minor line |
-| `1` | latest minor of the major line |
-| `latest` | most recent published release |
+| `1.0` | tip of the minor line |
+| `1` | tip of the major line |
 | `sha-<short>` | the exact commit |
 
 A pre-1.0 release is deliberately narrower. For `version = "0.9.0"` only these
@@ -89,12 +93,11 @@ are published:
 | Tag | Meaning |
 | --- | --- |
 | `0.9.0` | immutable release |
-| `0.9` | latest patch of the minor line |
+| `0.9` | tip of the minor line |
 | `sha-<short>` | the exact commit |
 
-There is no `0` tag and no `latest`: a 0.x line makes no stability promise, so it
-must never become what `:latest` resolves to. The pipeline starts publishing
-`<major>` and `latest` as soon as the crate version reaches `1.0.0`.
+A 0.x line makes no stability promise, so it gets no major tag either: `0` would
+suggest a moving major line that does not exist yet. Major tags start at `1`.
 
 The image carries the standard OCI labels (`source`, `revision`, `version`,
 `created`, `licenses`), so `org.opencontainers.image.revision` identifies the
